@@ -42,6 +42,19 @@ $Keep = @(
     'SecurityHealthSystray', 'msedgewebview2', 'csrss', 'winlogon', 'wininit', 'lsass', 'services', 'smss',
     'svchost', 'fontdrvhost', 'RuntimeBroker', 'dllhost'
 )
+# The apps chosen in setup (config.json). Also reads the older layout, which named three fixed apps.
+function Get-StreamApps {
+    $apps = (Get-Content (Join-Path $env:HERE 'config.json') -Raw | ConvertFrom-Json).apps
+    if ($apps -is [array]) { return $apps | Where-Object { $_.path -and $_.path -notlike 'INSERT_*' } }
+    foreach ($old in @(@('bettertok', 'BetterTok', 'bettertok-desktop'), @('spotify', 'Spotify', 'Spotify'),
+                       @('live_studio', 'TikTok LIVE Studio', 'TikTok LIVE Studio'))) {
+        $path = $apps.($old[0])
+        if ($path -and $path -notlike 'INSERT_*') { [pscustomobject]@{ name = $old[1]; process = $old[2]; path = $path } }
+    }
+}
+# the apps you chose for Start Stream are never asked about either
+$Keep += @(Get-StreamApps | ForEach-Object { $_.process })
+
 # Helpers installed in the same folder as a kept app are kept too (e.g. Stream Deck's QtWebEngineProcess).
 # Anything Game Boost can't see the location of is skipped, so core Windows processes are never offered.
 

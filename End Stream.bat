@@ -8,6 +8,17 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command "$s=[IO.File]::ReadAllTex
 $ErrorActionPreference = 'SilentlyContinue'
 $Programs = $env:HERE.TrimEnd('\')
 
+# The apps chosen in setup (config.json). Also reads the older layout, which named three fixed apps.
+function Get-StreamApps {
+    $apps = (Get-Content (Join-Path $env:HERE 'config.json') -Raw | ConvertFrom-Json).apps
+    if ($apps -is [array]) { return $apps | Where-Object { $_.path -and $_.path -notlike 'INSERT_*' } }
+    foreach ($old in @(@('bettertok', 'BetterTok', 'bettertok-desktop'), @('spotify', 'Spotify', 'Spotify'),
+                       @('live_studio', 'TikTok LIVE Studio', 'TikTok LIVE Studio'))) {
+        $path = $apps.($old[0])
+        if ($path -and $path -notlike 'INSERT_*') { [pscustomobject]@{ name = $old[1]; process = $old[2]; path = $path } }
+    }
+}
+
 function Close-Script($pattern, $label) {
     # the cmd windows they run in first, then anything left over
     $found = $false
@@ -43,17 +54,23 @@ if (Test-Path $pausedList) {
     else { Write-Host '  Put back the Windows services Game Boost paused' -ForegroundColor Green }
 }
 
-Write-Host ''
-$a = Read-Host '  Also close TikTok LIVE Studio, BetterTok and Spotify? (Y/N)'
-if ($a -match '^[Yy]') {
-    # LIVE Studio is asked nicely (never force-closed) so it can save your scenes
-    if ((Close-App 'TikTok LIVE Studio' 'TikTok LIVE Studio') -eq $false) {
-        Write-Host '  TikTok LIVE Studio is still in the tray - right-click its icon by the clock and choose Quit.' -ForegroundColor Yellow
-    }
-    foreach ($app in @(@('bettertok-desktop', 'BetterTok'), @('Spotify', 'Spotify'))) {
-        if ((Close-App $app[0] $app[1]) -eq $false) {
-            Get-Process -Name $app[0] -ErrorAction SilentlyContinue | Stop-Process -Force
-            Write-Host "  Closed $($app[1])" -ForegroundColor Green
+$apps = @(Get-StreamApps)
+if ($apps) {
+    Write-Host ''
+    $a = Read-Host "  Also close $(($apps | ForEach-Object { $_.name }) -join ', ')? (Y/N)"
+}
+if ($apps -and $a -match '^[Yy]') {
+    # Only these two get force-closed. Anything else might have unsaved work, and LIVE Studio needs to save your scenes.
+    $SafeToForce = @('bettertok-desktop', 'Spotify')
+    foreach ($app in $apps) {
+        if ((Close-App $app.process $app.name) -ne $false) { continue }
+        if ($SafeToForce -contains $app.process) {
+            Get-Process -Name $app.process -ErrorAction SilentlyContinue | Stop-Process -Force
+            Write-Host "  Closed $($app.name)" -ForegroundColor Green
+        } elseif ($app.process -like '*TikTok LIVE Studio*') {
+            Write-Host '  TikTok LIVE Studio is still in the tray - right-click its icon by the clock and choose Quit.' -ForegroundColor Yellow
+        } else {
+            Write-Host "  $($app.name) is still open - close it yourself." -ForegroundColor Yellow
         }
     }
 }

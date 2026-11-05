@@ -5,9 +5,15 @@
   "clips_folder": "",
   "recordings_folders": [],
   "gift_icons": {},
-  "apps": {
-    "bettertok": "INSERT_PATH_TO_BETTERTOK_HERE",
-    "spotify": "INSERT_PATH_TO_SPOTIFY_HERE",
-    "live_studio": "INSERT_PATH_TO_TIKTOK_LIVE_STUDIO_HERE"
-  }
+  "start_stream": {
+    "fortnite_chaos": true,
+    "game_boost": true
+  },
+  "apps": [
+    {
+      "name": "INSERT_APP_NAME_HERE",
+      "process": "INSERT_NAME_IN_TASK_MANAGER_HERE",
+      "path": "INSERT_PATH_TO_APP_HERE"
+    }
+  ]
 }

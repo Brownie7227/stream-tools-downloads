@@ -19,8 +19,9 @@ Windows tools for streaming Fortnite on TikTok LIVE. Viewer gifts trigger chaos 
 No GitHub account needed.
 
 1. Click **Code > Download ZIP** on this page. Unzip it somewhere you'll keep it.
-2. Double-click `SETUP.bat`. It installs what's missing and opens `config.json`. See the table below. You can
-   leave it all as it is to start with.
+2. Double-click `SETUP.bat`. It installs what's missing, then opens a window where you choose the apps Start Stream
+   opens and where your clips and reports go. It's safe to run again: anything already done gets confirmed and skipped,
+   and your settings only change if you choose to.
 3. Double-click `fortnite_chaos_LAUNCHER.bat`.
 4. In TikTok LIVE Studio, add a **Link** source: `http://127.0.0.1:8766/overlay.html`
 5. In your gift tool (BetterTok or TikFinity), make each gift trigger a webhook, like `http://127.0.0.1:8766/invert`.
@@ -30,7 +31,8 @@ To try every effect without sending gifts, open `http://127.0.0.1:8766/panel.htm
 
 ### config.json
 
-Your own settings live here. Updates never change it. Don't share it. Leave anything you don't use as it is.
+`SETUP.bat` saves your choices here, so you won't normally need to open it. Updates never change it. Don't share it,
+because it can hold your Discord token.
 
 | Setting | What to put |
 |---|---|
@@ -40,7 +42,8 @@ Your own settings live here. Updates never change it. Don't share it. Leave anyt
 | `clips_folder` | Where clips go. Blank uses `Clips` here |
 | `recordings_folders` | Extra folders with your stream recordings, as well as `Videos` |
 | `gift_icons` | Which gift picture shows beside an effect, like `{"random": "rose.png"}` |
-| `apps` | Where BetterTok, Spotify and LIVE Studio are, for `Start Stream.bat` |
+| `apps` | The apps `Start Stream.bat` opens and `End Stream.bat` offers to close |
+| `start_stream` | Whether `Start Stream.bat` runs Fortnite Chaos and Game Boost |
 
 In paths, use double backslashes: `C:\\Users\\you\\file.lnk`
 

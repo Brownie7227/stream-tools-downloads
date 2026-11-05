@@ -11,6 +11,7 @@
 !publish_public.py
 !config.example.json
 
+!setup_wizard.py
 !stream_config.py
 !updater.py
 !fortnite_chaos.py
