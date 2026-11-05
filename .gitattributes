@@ -1,0 +1,5 @@
+# Windows batch files must have Windows line endings, or cmd can misread them on friends' PCs
+*.bat text eol=crlf
+*.png binary
+*.mp3 binary
+*.wav binary

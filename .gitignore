@@ -1,0 +1,36 @@
+# Allow-list: nothing uploads unless it's named here. New files stay private until you add them.
+*
+
+!.gitignore
+!.gitattributes
+!README.md
+!VERSION
+!SETUP.bat
+!Make Release.bat
+!PUBLISHING.md
+!publish_public.py
+!config.example.json
+
+!stream_config.py
+!updater.py
+!fortnite_chaos.py
+!fortnite_chaos_LAUNCHER.bat
+!chaos_clips.py
+!stream_report.py
+
+!Start Stream.bat
+!End Stream.bat
+!Stream Doctor.bat
+!Stream Report.bat
+!Chaos Clips.bat
+!Game Boost.bat
+!focus_bettertok.bat
+!focus_tiktok_live_studio.bat
+!reset-jumpscare.bat
+
+!assets/
+!assets/fakeban_bg.png
+!assets/heartbeat.mp3
+!assets/jumpscare.wav
+!assets/gifts/
+!assets/gifts/*.png

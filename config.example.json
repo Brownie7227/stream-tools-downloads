@@ -1,0 +1,13 @@
+{
+  "discord_token": "INSERT_YOUR_DISCORD_BOT_TOKEN_HERE",
+  "discord_channel_id": "INSERT_YOUR_DISCORD_CHANNEL_ID_HERE",
+  "reports_folder": "",
+  "clips_folder": "",
+  "recordings_folders": [],
+  "gift_icons": {},
+  "apps": {
+    "bettertok": "INSERT_PATH_TO_BETTERTOK_HERE",
+    "spotify": "INSERT_PATH_TO_SPOTIFY_HERE",
+    "live_studio": "INSERT_PATH_TO_TIKTOK_LIVE_STUDIO_HERE"
+  }
+}
