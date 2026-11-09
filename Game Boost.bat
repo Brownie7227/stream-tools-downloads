@@ -54,6 +54,8 @@ function Get-StreamApps {
 }
 # the apps you chose for Start Stream are never asked about either
 $Keep += @(Get-StreamApps | ForEach-Object { $_.process })
+# Python runs Fortnite Chaos, and can be called python3.13 and the like depending on how it was installed
+$Keep += @(Get-Process | Where-Object { $_.Name -like 'python*' } | ForEach-Object { $_.Name } | Sort-Object -Unique)
 
 # Helpers installed in the same folder as a kept app are kept too (e.g. Stream Deck's QtWebEngineProcess).
 # Anything Game Boost can't see the location of is skipped, so core Windows processes are never offered.
@@ -218,7 +220,8 @@ foreach ($app in $apps) {
 }
 
 $AlwaysFile = Join-Path $env:LOCALAPPDATA 'GameBoost\always-close.txt'
-$always = @(if (Test-Path $AlwaysFile) { Get-Content $AlwaysFile | Where-Object { $_.Trim() } })
+# (anything on the keep list wins, even if it was added here by mistake)
+$always = @(if (Test-Path $AlwaysFile) { Get-Content $AlwaysFile | Where-Object { $_.Trim() -and $Keep -notcontains $_ -and $_ -notlike 'python*' } })
 if ($always) { Write-Host "  Always closed: $($always -join ', ')  (to change, edit $AlwaysFile)" -ForegroundColor Gray }
 $KeepFile = Join-Path $env:LOCALAPPDATA 'GameBoost\always-keep.txt'
 $alwaysKeep = @(if (Test-Path $KeepFile) { Get-Content $KeepFile | Where-Object { $_.Trim() } })

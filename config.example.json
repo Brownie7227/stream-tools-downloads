@@ -5,6 +5,9 @@
   "clips_folder": "",
   "recordings_folders": [],
   "gift_icons": {},
+  "gift_power": {},
+  "menu_every_minutes": 5,
+  "vote_every_minutes": 5,
   "start_stream": {
     "fortnite_chaos": true,
     "game_boost": true

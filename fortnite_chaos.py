@@ -64,6 +64,12 @@ ON-STREAM TIMER: the overlay shows which effect is running and how long is left.
   Add ?timer=bottom to the overlay link to put it at the bottom, or ?timer=off to hide it.
 ON-STREAM BANNER: the overlay also shows the "who sent what" banner (moves to the top with ?timer=bottom).
 COMBO METER: every gift fills the overlay's bar. COMBO_GOAL gifts inside COMBO_WINDOW seconds fires /chaos.
+CHAT VOTES: send chat messages to /chat (?user=NAME&text=MESSAGE, or a JSON body with the comment). Every
+  vote_every_minutes (config.json, default 5) chat gets 30s to type 1-4 and the winner fires. Votes only start once
+  chat messages are arriving. /vote starts one now.
+GIFT STRENGTH: config.json "gift_power": {"Rose": 1, "Galaxy": 3} makes a gift's effects last that many times longer.
+GIFT MENU: shows itself on the overlay for 12s every menu_every_minutes (config.json, default 5; 0 turns it off).
+CRASHES: if Fortnite Chaos crashes it restarts itself in the same window (it gives up after 5 crashes in 2 minutes).
 TOP SENDERS: every 5-10 minutes the overlay shows who sent the most effects this stream.
 The wheel, combo meter, top senders and gift menu are on the overlay only, so they don't cover your own screen.
 
@@ -85,6 +91,7 @@ import base64
 import csv
 import ctypes
 import ctypes.wintypes as wt
+import hashlib
 import json
 import math
 import os
@@ -94,6 +101,8 @@ import re
 import socket
 import ssl
 import struct
+import subprocess
+import sys
 import threading
 import time
 import traceback
@@ -182,12 +191,20 @@ COMBO_GOAL = 10           # gifts needed to fire /chaos
 COMBO_WINDOW = 60         # ...within this many seconds
 TOP_SENDER_EVERY = (300, 600)  # show the top senders every 5-10 minutes
 TOP_SENDER_SECONDS = 8    # for this long
+MENU_SHOW_SECONDS = 12    # the gift menu shows itself for this long, every menu_every_minutes (config.json)
+VOTE_SECONDS = 30         # how long chat gets to vote
+VOTE_OPTIONS = 4
+VOTE_RESULT_SECONDS = 4   # the winner stays up this long
+CHAT_ALIVE_SECONDS = 300  # votes only start if a chat message arrived within this long
+NAMED_EFFECTS = {"fakeban", "bsod", "creeper"}  # these show the gifter's name inside the effect
+RESTART_CODE, ALREADY_RUNNING = 3, 2  # exit codes the crash restarter understands
 TOP_SENDER_COUNT = 3      # how many names
 NOT_A_GIFT = {"", "test panel"}  # never listed as a top sender (lower case)
 FAKE_BAN_TITLE = "YOU HAVE BEEN BANNED"
 FAKE_BAN_TEXT = ("Your account has been permanently banned for cheating,\n"
                  "exploits, or receiving too many gifts from viewers.\n"
                  "We recommend not streaming Fortnite ever again.")
+OVERLAY_PUSH_GAP = 0.05    # seconds between overlay updates while something is changing
 CREEPER_FUSE = 1.5        # seconds of hissing face before the explosion
 CREEPER_BLAST = 0.15      # seconds of white when it blows
 CREEPER_HOLE = 0.36       # hole size, as a fraction of the screen height
@@ -206,6 +223,7 @@ CREDIT_AFTER = {"fakeban", "bsod"}  # the banner naming the sender comes when th
 TIMED_SCREEN = {"blink", "lowhp", "creeper"}  # screen effects that show a timer on the overlay
 MOVES = {"lookdown", "lookup", "spin", "mapspam"}  # timed, but stack with controls instead of replacing them
 INSTANT = {"emote"}  # one-offs that don't replace anything
+RANDOM_POOL = CONTROL | SCREEN | MOVES | INSTANT
 # Chaos Mode only combines effects from different groups, so they never fight over the same keys
 GROUPS = [{"invert", "rotate"}, {"jumpswap"}, {"noscope"}, {"invertmouse", "sensitivity"}]
 MOVE_KEYS = (W, A, S, D, SPACE)
@@ -442,6 +460,9 @@ combo = {"times": []}  # when the recent gifts came in
 senders = {}  # sender name -> effects sent this stream
 top_show = {"next": time.time() + random.uniform(*TOP_SENDER_EVERY), "until": 0.0}
 menu = {"on": False}  # gift menu on the overlay
+menu_show = {"next": 0.0, "until": 0.0}  # when the gift menu next shows itself
+chat = {"last": 0.0}  # when the last chat message arrived
+vote = {"id": 0, "options": [], "votes": {}, "until": 0.0, "winner": None, "show_until": 0.0, "next": 0.0}
 _logq = queue.Queue()
 
 
@@ -543,18 +564,121 @@ def _stack(name, secs, now):
         _start(name, now + secs)
 
 
+_bags = {}  # shuffled draws for random chaos and the wheel, so nothing repeats until everything has had a turn
+
+
+def _draw(key, pool):
+    """Next pick from a shuffled bag. A new bag never starts with the effect that just ended the last one."""
+    bag = _bags.setdefault(key, {"left": [], "last": None})
+    bag["left"] = [x for x in bag["left"] if x in pool]  # effects switched off since stay out
+    if not bag["left"]:
+        bag["left"] = random.sample(sorted(pool), len(pool))
+        if len(bag["left"]) > 1 and bag["left"][-1] == bag["last"]:
+            bag["left"][0], bag["left"][-1] = bag["left"][-1], bag["left"][0]
+    bag["last"] = bag["left"].pop()
+    return bag["last"]
+
+
 def _spin_wheel(pick):
     """Start the overlay's wheel, landing on `pick`. False if it's already spinning for another gift."""
     with lock:
         now = time.time()
         if now < wheel["until"]:
             return False
-        others = random.sample(sorted((CONTROL | SCREEN | MOVES | INSTANT) - {pick}), 7)
+        others = random.sample(sorted(RANDOM_POOL - {pick}), 7)
         at = random.randrange(8)
         others.insert(at, pick)
         wheel.update(id=wheel["id"] + 1, names=[SHORT_NAMES[n] for n in others], pick=at,
                      until=now + WHEEL_SPIN + WHEEL_HOLD)
     return True
+
+
+def start_vote():
+    """Chat gets VOTE_SECONDS to type 1-4. Returns the options."""
+    with lock:
+        now = time.time()
+        vote.update(id=vote["id"] + 1, options=random.sample(sorted(RANDOM_POOL), VOTE_OPTIONS), votes={},
+                    until=now + VOTE_SECONDS, winner=None, show_until=0.0,
+                    next=now + max(1.0, _minutes("vote_every_minutes", 5)) * 60)
+        return list(vote["options"])
+
+
+def add_chat(user, text):
+    """A chat message. Returns the option it voted for (1-4), or None."""
+    with lock:
+        chat["last"] = time.time()
+        m = re.fullmatch(r"\s*#?\s*([1-9])\s*", text or "")
+        if not m or time.time() >= vote["until"] or not (1 <= int(m.group(1)) <= len(vote["options"])):
+            return None
+        key = user or f"anon{len(vote['votes'])}"  # nameless messages each count once
+        vote["votes"][key] = int(m.group(1))  # changing your mind replaces your vote
+        return int(m.group(1))
+
+
+def finish_vote():
+    """Counts the votes and fires the winner. Returns the winning effect, or None if nobody voted."""
+    with lock:
+        counts = [0] * len(vote["options"])
+        for choice in vote["votes"].values():
+            counts[choice - 1] += 1
+        vote["until"] = 0.0
+        if not any(counts):
+            vote["show_until"] = 0.0
+            return None
+        best = max(counts)
+        vote["winner"] = random.choice([i for i, c in enumerate(counts) if c == best])
+        vote["show_until"] = time.time() + VOTE_RESULT_SECONDS
+        effect = vote["options"][vote["winner"]]
+    activate(effect, None, "Chat vote", None, counted=False)
+    return effect
+
+
+def vote_loop():
+    """Ends votes when time's up, and starts the next one if chat is talking."""
+    # the first vote waits a full interval, instead of starting on the stream's first chat message
+    vote["next"] = max(vote["next"], time.time() + _minutes("vote_every_minutes", 5) * 60)
+    while True:
+        time.sleep(0.5)
+        try:
+            now = time.time()
+            if vote["until"] and now >= vote["until"]:
+                finish_vote()
+            every = _minutes("vote_every_minutes", 5)
+            if (every and not vote["until"] and now >= vote["next"] and now - chat["last"] < CHAT_ALIVE_SECONDS):
+                start_vote()
+        except Exception:
+            traceback.print_exc()
+
+
+def _minutes(key, default):
+    try:
+        return max(0.0, float(stream_config.get(key, default)))
+    except (TypeError, ValueError):
+        return float(default)
+
+
+def _gift_power(gift):
+    """How many times longer this gift's effects last (config.json "gift_power"). 1 if it isn't listed."""
+    powers = stream_config.get("gift_power", {})
+    if not gift or not isinstance(powers, dict):
+        return 1.0
+    for name, power in powers.items():
+        if _gift_key(str(name)) == _gift_key(gift):
+            try:
+                return min(10.0, max(0.1, float(power)))
+            except (TypeError, ValueError):
+                return 1.0
+    return 1.0
+
+
+def _powered(secs, power):
+    """Gift strength makes an effect longer, but never past MAX_STACK_SECONDS (a longer ?seconds= is kept)."""
+    return secs if power == 1 else min(secs * power, max(secs, MAX_STACK_SECONDS))
+
+
+def _stop_code(who):
+    code = re.sub(r"[^A-Z0-9]+", "_", (who or "").upper()).strip("_")[:20]
+    return f"{code}_DID_THIS" if code else "TOO_MANY_GIFTS"
 
 
 def _count_gift(who):
@@ -575,9 +699,9 @@ def activate(name, secs=None, who=None, gift=None, mystery=False, counted=True):
     if counted and _count_gift(_clean(who)):
         threading.Timer(0.3, activate, ("chaos",), {"who": "GIFT COMBO", "counted": False}).start()
     if name == "random":  # any effect, Chaos Mode, or the wheel
-        name, mystery = random.choice(sorted(CONTROL | SCREEN | MOVES | INSTANT) + ["chaos", "wheel"]), True
+        name, mystery = _draw("random", RANDOM_POOL | {"chaos", "wheel"}), True
     if name == "wheel":
-        name, mystery = random.choice(sorted(CONTROL | SCREEN | MOVES | INSTANT)), True
+        name, mystery = _draw("wheel", RANDOM_POOL), True
         if _spin_wheel(name):  # the effect waits for the wheel. If it's already spinning, this gift fires right away.
             threading.Timer(WHEEL_SPIN, activate, (name, secs, who, gift), {"mystery": True, "counted": False}).start()
             return name
@@ -587,6 +711,7 @@ def activate(name, secs=None, who=None, gift=None, mystery=False, counted=True):
     sender = who or "Someone"
     headline = f"{sender} sent {gift}" if gift else f"{sender} triggered an effect"
     icon = _gift_icon(gift)
+    power = _gift_power(gift)
 
     now = time.time()
     left = None
@@ -595,7 +720,7 @@ def activate(name, secs=None, who=None, gift=None, mystery=False, counted=True):
         label = EFFECT_NAMES[name]
         logged = name
     elif name == "chaos":
-        secs = secs or _length("chaos")
+        secs = _powered(secs or _length("chaos"), power)
         pool = random.sample(GROUPS, 2)
         picks = [random.choice(sorted(g)) for g in pool]
         with lock:
@@ -606,9 +731,11 @@ def activate(name, secs=None, who=None, gift=None, mystery=False, counted=True):
         label = "CHAOS MODE: " + " + ".join(EFFECT_NAMES[n] for n in picks)
         logged = "chaos:" + "+".join(picks)
     else:
-        secs = secs or _length(name)
+        secs = _powered(secs or _length(name), power)
         with lock:
             _stack(name, secs, now)
+            if name in NAMED_EFFECTS:
+                data[name]["who"] = who
             _rebuild()
             left = active[name] - now
         label = EFFECT_NAMES[name]
@@ -956,7 +1083,8 @@ def memory_watcher():
             except OSError:
                 pass  # e.g. the file is open in Excel - skip this minute
             if m.dwMemoryLoad >= PC_RAM_WARN_PERCENT and not ram_warned:
-                hogs = [u for u in sorted(usage, key=lambda u: -u[2]) if u[0].lower() not in DO_NOT_CLOSE][:3]
+                hogs = [u for u in sorted(usage, key=lambda u: -u[2])
+                        if u[0].lower() not in DO_NOT_CLOSE and not u[0].lower().startswith("python")][:3]
                 biggest = ", ".join(f"{n} {mb / 1024:.1f} GB" for n, _, mb in hogs)
                 popups.put((f"PC memory is {m.dwMemoryLoad}% full", f"Biggest: {biggest}"))
                 log(f"{time.strftime('%H:%M:%S')} - PC memory at {m.dwMemoryLoad}%")
@@ -1357,10 +1485,20 @@ OVERLAY_HTML = """<!doctype html><html><head><meta charset="utf-8">
 #combo .t{display:flex;justify-content:space-between}#combo .s{color:#ffcf40}
 #combo .bar{height:1vh;margin-top:.7vh;border-radius:.5vh;background:rgba(255,255,255,.18);overflow:hidden}
 #combo .bar i{display:block;height:100%;background:linear-gradient(90deg,#ffcf40,#ff3b5c);transition:width .2s}
-#top{position:fixed;left:2vh;bottom:11vh;width:30vh;box-sizing:border-box;display:none;padding:1.4vh 2vh;border-radius:1.4vh;background:rgba(10,10,10,.86);
+#top{position:fixed;left:2vh;bottom:19.5vh;width:30vh;box-sizing:border-box;display:none;padding:1.4vh 2vh;border-radius:1.4vh;background:rgba(10,10,10,.86);
   color:#fff;font:700 2.4vh 'Segoe UI',Arial,sans-serif}
 #top h3{margin:0 0 .8vh;font-size:2.4vh;color:#ffcf40}#top div{display:flex;justify-content:space-between;gap:1vh;margin-top:.3vh}
 #top span:first-child{overflow:hidden;white-space:nowrap;text-overflow:ellipsis}
+#vote{position:fixed;right:2vh;bottom:3vh;width:34vh;display:none;box-sizing:border-box;padding:1.2vh 1.6vh;
+  border-radius:1.4vh;background:rgba(10,10,10,.88);color:#fff;font:700 2.1vh 'Segoe UI',Arial,sans-serif}
+#vote h3{margin:0 0 .8vh;font-size:2.2vh;color:#ffcf40;display:flex;justify-content:space-between}
+#vote .o{display:grid;grid-template-columns:3vh 1fr 3vh;align-items:center;gap:.8vh;margin-top:.5vh;padding:.3vh .6vh;border-radius:.6vh}
+#vote .o b{color:#ffcf40}#vote .o.win{background:#ff3b5c}
+#vote .bar{grid-column:2/4;height:.7vh;border-radius:.4vh;background:rgba(255,255,255,.15);overflow:hidden}
+#vote .bar i{display:block;height:100%;background:#ffcf40;transition:width .3s}
+#fakeban .by{font:700 2.2vh 'Segoe UI',Arial,sans-serif;color:#86d4ff;margin-top:2.2vh}
+#creeperby{position:absolute;left:0;right:0;top:50%;transform:translateY(-50%);text-align:center;color:#fff;
+  font:min(9vh,9vw)/1 Impact,sans-serif;text-shadow:0 0 2vh #000}
 #menu{position:fixed;right:2vh;top:12vh;width:27vh;display:none;padding:1.2vh 1.4vh;border-radius:1.4vh;background:rgba(10,10,10,.82);
   color:#fff;font:700 1.9vh 'Segoe UI',Arial,sans-serif}
 #menu h3{margin:.8vh 0 .3vh;font-size:1.6vh;letter-spacing:.1vh;color:#ffcf40;text-transform:uppercase}#menu h3:first-child{margin-top:0}
@@ -1370,11 +1508,12 @@ OVERLAY_HTML = """<!doctype html><html><head><meta charset="utf-8">
 <div id="blind" class="fx"></div><div id="fog" class="fx"></div>
 <div id="lowhp" class="fx"></div>
 <div id="lidt" class="fx"></div><div id="lidb" class="fx"></div>
-<div id="creeper" class="fx"><canvas id="crater"></canvas><canvas id="face"></canvas></div>
-<div id="fakeban" class="fx"><div class="ico">!</div><div class="ttl">__BAN_TITLE__</div><div class="ln"></div><div class="msg">__BAN_TEXT__</div><div class="ln"></div><div class="btn">CONTINUE</div></div>
-<div id="bsod" class="fx"><b>:(</b><p>Your PC ran into a problem and needs to restart. We're just collecting some error info, and then we'll restart for you.</p><p>20% complete</p><small>Stop code: TOO_MANY_GIFTS</small></div>
+<div id="creeper" class="fx"><canvas id="crater"></canvas><canvas id="face"></canvas><div id="creeperby"></div></div>
+<div id="fakeban" class="fx"><div class="ico">!</div><div class="ttl">__BAN_TITLE__</div><div class="ln"></div><div class="msg">__BAN_TEXT__</div><div class="ln"></div><div class="btn">CONTINUE</div><div class="by"></div></div>
+<div id="bsod" class="fx"><b>:(</b><p>Your PC ran into a problem and needs to restart. We're just collecting some error info, and then we'll restart for you.</p><p>20% complete</p><small>Stop code: <span id="bsodcode">TOO_MANY_GIFTS</span></small></div>
 <div id="scare" class="fx"></div><div id="flash" class="fx"></div>
 <div id="menu"></div>
+<div id="vote"></div>
 <div id="timers"></div>
 <div id="combo"><div class="t"><span>GIFT COMBO</span><span class="s"></span></div><div class="bar"><i></i></div></div>
 <div id="top"></div>
@@ -1427,6 +1566,8 @@ function drawCrater(){
 function renderExtras(s){
   const fx=s.effects;
   $('fakeban').style.display=fx.fakeban?'flex':'none';
+  if(fx.fakeban)$('fakeban').querySelector('.by').textContent=fx.fakeban.who?'Banned by: '+fx.fakeban.who:'';
+  if(fx.bsod)$('bsodcode').textContent=fx.bsod.code||'TOO_MANY_GIFTS';
   $('bsod').style.display=fx.bsod?'block':'none';
   const a=fx.blink?fx.blink.amount:0;
   $('lidt').style.display=$('lidb').style.display=a>0?'block':'none';
@@ -1440,11 +1581,17 @@ function renderExtras(s){
     $('face').style.display=e<FUSE?'block':'none';
     $('face').style.filter=(e>FUSE*.45&&Math.floor(e*8)%2)?'brightness(3)':'none';
     $('crater').style.display=e>=FUSE+BLAST?'block':'none';
+    $('creeperby').textContent=(e>=FUSE+BLAST&&fx.creeper.who)?fx.creeper.who.toUpperCase()+' WAS HERE':'';
   }else{creeperOn=false;$('creeper').style.display='none';}
   if(s.wheel){
     if(s.wheel.id!==wheelId){wheelId=s.wheel.id;drawWheel(s.wheel);}
     $('wheelbox').style.display='block';
   }else $('wheelbox').style.display='none';
+  const v=s.vote,vb=$('vote');
+  if(v){vb.style.display='block';const total=v.counts.reduce((a,b)=>a+b,0)||1;
+    vb.innerHTML='<h3><span>'+(v.winner===null?'CHAT VOTE - type 1-'+v.options.length:'CHAT PICKED')+'</span><span>'+(v.winner===null?Math.ceil(v.left)+'s':'')+'</span></h3>'
+      +v.options.map((o,i)=>'<div class="o'+(v.winner===i?' win':'')+'"><b>'+(i+1)+'</b><span>'+esc(o)+'</span><span>'+v.counts[i]+'</span><div class="bar"><i style="width:'+(v.counts[i]/total*100)+'%"></i></div></div>').join('');
+  }else vb.style.display='none';
   const c=s.combo;$('combo').style.display=c?'block':'none';
   if(c){$('combo').querySelector('.s').textContent=c.count+' / '+c.goal;$('combo').querySelector('i').style.width=c.count/c.goal*100+'%';}
   const t=s.top?'<h3>Top chaos senders</h3>'+s.top.map(p=>'<div><span>'+esc(p.who)+'</span><span>'+p.count+'</span></div>').join(''):'';
@@ -1454,9 +1601,10 @@ function renderExtras(s){
   if(m!==lastMenu){lastMenu=m;$('menu').innerHTML=m;}
   $('menu').style.display=m?'block':'none';
 }
-async function poll(){
+let ver=null;
+function renderState(s){
   try{
-    const s=await (await fetch('/overlay/state',{cache:'no-store'})).json();
+    if(s.v){if(ver===null)ver=s.v;else if(s.v!==ver){location.reload();return;}}
     const fx=s.effects;
     $('blind').style.display=fx.blind?'block':'none';
     $('fog').style.display=fx.fog?'block':'none';
@@ -1476,13 +1624,26 @@ async function poll(){
       if(b.icon){const im=new Image();im.src=b.icon;$('banner').prepend(im);}}
     $('banner').classList.toggle('on',!!b);
   }catch(e){}
+}
+// Updates are pushed from Fortnite Chaos as they happen. If that stops (or never starts in this browser),
+// it falls back to asking 20 times a second, and switches back when pushes resume.
+let pushed=false,lastPush=0;
+async function poll(){
+  if(pushed)return;
+  try{renderState(await (await fetch('/overlay/state',{cache:'no-store'})).json());}catch(e){}
   setTimeout(poll,50);
 }
+try{
+  const es=new EventSource('/overlay/events');
+  es.onmessage=e=>{lastPush=Date.now();pushed=true;try{renderState(JSON.parse(e.data));}catch(x){}};
+}catch(e){}
+setInterval(()=>{if(pushed&&Date.now()-lastPush>3500){pushed=false;poll();}},1000);
 poll();
 </script></body></html>""".replace("HOLE", str(round(BLIND_HOLE * 100))).replace(
     "__SPIN__", str(WHEEL_SPIN)).replace("__FUSE__", str(CREEPER_FUSE)).replace(
     "__BLAST__", str(CREEPER_BLAST)).replace("__CRATER__", str(CREEPER_HOLE)).replace(
     "__BAN_TITLE__", FAKE_BAN_TITLE).replace("__BAN_TEXT__", FAKE_BAN_TEXT)
+OVERLAY_VERSION = hashlib.md5(OVERLAY_HTML.encode("utf-8")).hexdigest()[:10]  # overlays reload when this changes
 
 
 def overlay_state():
@@ -1500,6 +1661,10 @@ def overlay_state():
                 fx[n]["pulse"] = round(lowhp_pulse(elapsed), 3)
             elif n == "creeper":
                 fx[n]["elapsed"] = round(elapsed, 3)
+            if n in NAMED_EFFECTS:
+                fx[n]["who"] = (data.get(n) or {}).get("who", "")
+                if n == "bsod":
+                    fx[n]["code"] = _stop_code(fx[n]["who"])
         timers = [{"label": EFFECT_NAMES[n], "left": round(active[n] - now, 1), "total": totals[n]}
                   for n in sorted((CONTROL | MOVES | TIMED_SCREEN) & set(active), key=lambda n: active[n])]
         banner = None
@@ -1518,14 +1683,27 @@ def overlay_state():
         if now < top_show["until"]:
             best = sorted(senders.items(), key=lambda p: -p[1])[:TOP_SENDER_COUNT]
             top = [{"who": w, "count": c} for w, c in best]
+        every_menu = _minutes("menu_every_minutes", 5)
+        if every_menu and now >= menu_show["next"]:
+            if menu_show["next"]:  # not on the very first look, so it doesn't pop up the moment Chaos starts
+                menu_show["until"] = now + MENU_SHOW_SECONDS
+            menu_show["next"] = now + every_menu * 60
+        voting = None
+        if now < vote["until"] or now < vote["show_until"]:
+            counts = [0] * len(vote["options"])
+            for choice in vote["votes"].values():
+                counts[choice - 1] += 1
+            voting = {"id": vote["id"], "options": [SHORT_NAMES.get(o, o) for o in vote["options"]], "counts": counts,
+                      "left": max(0.0, round(vote["until"] - now, 1)), "winner": vote["winner"]}
         menu_list = None
-        if menu["on"]:
+        if menu["on"] or now < menu_show["until"]:
             menu_list = [{"title": title, "items": [
                 {"name": SHORT_NAMES.get(n) or PANEL_LABELS.get(n, n), "on": n in active,
                  "icon": _gift_icon(GIFT_ICONS[n]) if n in GIFT_ICONS else None} for n in names]}
                 for title, names in MENU_GROUPS]
         return {"effects": fx, "timers": timers, "banner": banner, "image": bool(_find_file("jumpscare.png")),
-                "wheel": spin, "combo": streak, "top": top, "menu": menu_list}
+                "wheel": spin, "combo": streak, "top": top, "menu": menu_list,
+                "vote": voting, "v": OVERLAY_VERSION}
 
 
 MENU_GROUPS = [
@@ -1541,10 +1719,12 @@ PANEL_GROUPS = [
     ("Screen", ["blind", "fog", "jumpscare", "flashbang", "fakeban", "bsod", "blink", "lowhp", "creeper"]),
     ("Specials", ["random", "wheel", "chaos"]),
     ("Overlay", ["menu", "topsender"]),
+    ("Chat vote", ["vote", "chat?user=Test&text=1"]),
 ]
 PANEL_LABELS = dict(EFFECT_NAMES, random="Random chaos", wheel="Spin the wheel", chaos="Two at once",
                     menu="Show or hide gift menu",
-                    topsender="Show top senders now")
+                    topsender="Show top senders now", vote="Start a chat vote now",
+                    **{"chat?user=Test&text=1": "Test chat: vote 1"})
 
 PANEL_HTML = '''<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Fortnite Chaos panel</title>
@@ -1574,7 +1754,7 @@ GROUPS
 async function go(name){
   const s=document.getElementById('secs').value;
   const q=new URLSearchParams({user:'Test panel'});if(s&&name!=='off')q.set('seconds',s);
-  try{await fetch('/'+name+'?'+q,{cache:'no-store'})}catch(e){}
+  try{await fetch('/'+name+(name.includes('?')?'&':'?')+q,{cache:'no-store'})}catch(e){}
   status();
 }
 async function status(){
@@ -1626,8 +1806,9 @@ def _from_body(body):
     return who, gift
 
 
-ROUTES = sorted(CONTROL | SCREEN | MOVES | INSTANT) + ["random", "wheel", "chaos", "off", "status", "menu", "topsender"]
-ACTIVATE_ROUTES = set(ROUTES) - {"off", "status", "menu", "topsender"}
+ROUTES = sorted(CONTROL | SCREEN | MOVES | INSTANT) + ["random", "wheel", "chaos", "off", "status", "menu", "topsender",
+                                                      "chat", "vote"]
+ACTIVATE_ROUTES = set(ROUTES) - {"off", "status", "menu", "topsender", "chat", "vote"}
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -1640,6 +1821,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Private-Network", "true")
+        self.send_header("Content-Length", str(len(body)))  # LIVE Studio's Link source was only reliable with this
         self.end_headers()
         self.wfile.write(body)
 
@@ -1655,6 +1837,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, PANEL_HTML.encode(), "text/html")
         if name == "overlay/state":
             return self._reply(200, overlay_state())
+        if name == "overlay/events":
+            return self._push_overlay()
         if name.startswith("gifts/") and name.endswith(".png"):
             file = _gift_files.get(name[6:-4])  # only the pictures found in the folder, nothing else
             if not file:
@@ -1695,6 +1879,19 @@ class Handler(BaseHTTPRequestHandler):
                 menu["on"] = show == "1" if show in ("0", "1") else not menu["on"]
                 on = menu["on"]
             self._reply(200, {"ok": True, "menu": on})
+        elif name == "chat":
+            user = (q.get("user") or q.get("nickname") or [""])[0]
+            text = (q.get("text") or q.get("comment") or q.get("message") or [""])[0]
+            if body and not text:
+                try:
+                    parsed = json.loads(body.decode("utf-8", "ignore"))
+                    text = next((_find(parsed, k) for k in ("comment", "message", "text", "content") if _find(parsed, k)), "")
+                    user = user or (b_who if (b_who := _from_body(body)[0]) else "")
+                except ValueError:
+                    pass
+            self._reply(200, {"ok": True, "voted": add_chat(_clean(user), text)})
+        elif name == "vote":
+            self._reply(200, {"ok": True, "options": start_vote()})
         elif name == "topsender":
             with lock:
                 top_show["until"] = time.time() + TOP_SENDER_SECONDS if senders else 0.0
@@ -1709,6 +1906,30 @@ class Handler(BaseHTTPRequestHandler):
             self._reply(200, {"ok": True, "effect": activate(name, secs, who, gift)})
         else:
             self._reply(404, {"routes": ROUTES})
+
+    def _push_overlay(self):
+        """Sends the overlay its state whenever it changes (20 times a second at most), plus a heartbeat every
+        second so it knows the connection is alive. Ends when the overlay goes away."""
+        if self.command == "HEAD":  # a stream never ends, so a HEAD request would hang
+            return self._send(200, b"", "text/event-stream")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        last, beat = None, 0.0
+        try:
+            self.wfile.write(b"retry: 1000\n\n")
+            while True:
+                state = json.dumps(overlay_state(), separators=(",", ":"))
+                now = time.time()
+                if state != last or now - beat >= 1:
+                    self.wfile.write(b"data: " + state.encode() + b"\n\n")
+                    self.wfile.flush()
+                    last, beat = state, now
+                time.sleep(OVERLAY_PUSH_GAP)
+        except (OSError, ValueError):
+            pass  # the overlay closed or reloaded
 
     def do_POST(self):
         n = int(self.headers.get("Content-Length") or 0)
@@ -1978,6 +2199,7 @@ def run_popups():
                     justify="center")
     ban.create_rectangle(mid - 96 * u, 660 * u, mid + 96 * u, 716 * u, fill="#e2d900", outline="")
     ban.create_text(mid, 688 * u, text="CONTINUE", font=("Impact", -int(32 * u)), fill="#14202c")
+    ban_by = ban.create_text(mid, 760 * u, text="", font=("Segoe UI", -int(24 * u), "bold"), fill="#86d4ff")
 
     # Fake blue screen
     bs = tk.Frame(wins["bsod"], bg="#0078d7")
@@ -1987,7 +2209,8 @@ def run_popups():
                         "and then we'll restart for you.", ("Segoe UI", int(sh * .023))),
                        ("20% complete", ("Segoe UI", int(sh * .023))),
                        ("Stop code: TOO_MANY_GIFTS", ("Segoe UI", int(sh * .013)))):
-        tk.Label(bs, text=text, font=font, fg="#ffffff", bg="#0078d7", justify="left").pack(anchor="w", pady=int(sh * .018))
+        bsod_code = tk.Label(bs, text=text, font=font, fg="#ffffff", bg="#0078d7", justify="left")
+        bsod_code.pack(anchor="w", pady=int(sh * .018))  # the last one made is the stop code
 
     # Eyelids: two black shapes, moved only while blinking
     lids = tk.Canvas(wins["blink"], width=sw, height=sh, bg=KEY, highlightthickness=0)
@@ -2027,7 +2250,7 @@ def run_popups():
     crater = tk.Canvas(wins["creeper"], width=sw, height=sh, bg=KEY, highlightthickness=0)
     crater.pack()
 
-    def draw_crater():
+    def draw_crater(who=""):
         crater.delete("all")
         b = sh // 18 + 1
         r = sh * CREEPER_HOLE
@@ -2046,6 +2269,9 @@ def run_popups():
                     colour = random.choice(dirt)
                 if colour:
                     crater.create_rectangle(i * b, j * b, (i + 1) * b, (j + 1) * b, fill=colour, outline="")
+        if who:
+            crater.create_text(sw / 2, sh / 2, text=f"{who.upper()} WAS HERE", fill="#ffffff",
+                               font=("Impact", -int(sh * .07)))
 
     hwnds = {n: click_through(w) for n, w in wins.items()}
     for n in ("blind", "jumpscare", "fakeban", "bsod", "blink", "creeper", "creeper_face"):
@@ -2073,7 +2299,12 @@ def run_popups():
         except Exception:
             log(f"WARNING: couldn't play {os.path.basename(path)}")
 
-    def start_screen(name):
+    def start_screen(name, info=None):
+        who = (info or {}).get("who", "")
+        if name == "fakeban":
+            ban.itemconfig(ban_by, text=f"Banned by: {who}" if who else "")
+        elif name == "bsod":
+            bsod_code.config(text=f"Stop code: {_stop_code(who)}")
         if name == "jumpscare":
             play(sound)
         elif name == "lowhp":
@@ -2081,7 +2312,7 @@ def run_popups():
             state["heart_at"] = time.time()
         elif name == "creeper":
             play(creeper_sound)
-            draw_crater()
+            draw_crater(who)
             face.itemconfig(blast, state="hidden")
             face.itemconfig(fuse_flash, state="hidden")
             state["creeper_stage"] = "fuse"
@@ -2155,7 +2386,7 @@ def run_popups():
                 elif n == "lowhp":
                     update_lowhp(spent[n])
                 if n not in screens or screens[n] is not started:  # new, or restarted
-                    start_screen(n)
+                    start_screen(n, started)
                     screens[n] = started
                     new = True
                 if n == "creeper":
@@ -2192,13 +2423,15 @@ def main():
         print(f"\nERROR: another copy of Fortnite Chaos is already running (port {PORT} is taken).")
         print("Close the other window, or run:  taskkill /f /im python.exe   then start this again.")
         input("\nPress Enter to close...")
-        raise SystemExit(1)
+        raise SystemExit(ALREADY_RUNNING)
 
     try:  # asks first, and says nothing if there's no update or no internet
         import updater
         print(f"Fortnite Chaos {updater.local_version()}")
         if updater.check_and_prompt():
             server.server_close()
+            if "--child" in sys.argv:
+                raise SystemExit(RESTART_CODE)  # the restarter opens the new version in this window
             updater.restart(os.path.abspath(__file__))
             return
     except Exception as e:
@@ -2225,6 +2458,7 @@ def main():
     threading.Thread(target=focus_watcher, daemon=True).start()
     threading.Thread(target=memory_watcher, daemon=True).start()
     threading.Thread(target=discord_bot, daemon=True).start()
+    threading.Thread(target=vote_loop, daemon=True).start()
     threading.Thread(target=server.serve_forever, daemon=True).start()
     try:
         flash_server = ThreadingHTTPServer(("127.0.0.1", FLASHBANG_PORT), FlashbangHandler)
@@ -2244,6 +2478,9 @@ def main():
     print(f"  heartbeat sound: {_find_file('heartbeat.mp3') or 'not found, /lowhp will be silent'}")
     print(f"  gift pictures found: {len(_gift_files)}")
     print("Panic key: F8 restores your controls (and mouse) instantly.")
+    if "--restarted" in sys.argv:
+        announce("Fortnite Chaos restarted", "It crashed and came straight back")
+        print("NOTE: restarted after a crash - the error is above.")
 
     try:
         run_popups()
@@ -2251,5 +2488,32 @@ def main():
         clear("closing")
 
 
+def supervise():
+    """Runs Fortnite Chaos and starts it again if it crashes. Closing the window still closes everything."""
+    if os.name != "nt" or "--child" in sys.argv:
+        return main()
+    crashes, restarted = [], False
+    while True:
+        try:
+            code = subprocess.call([sys.executable, os.path.abspath(__file__), "--child"] +
+                                   (["--restarted"] if restarted else []), cwd=HERE)
+        except KeyboardInterrupt:
+            return
+        if code in (0, ALREADY_RUNNING):
+            return
+        if code == RESTART_CODE:  # updated: open the new version
+            restarted = False
+            continue
+        now = time.time()
+        crashes = [t for t in crashes if now - t < 120] + [now]
+        if len(crashes) > 5:
+            print("\nFortnite Chaos crashed 5 times in 2 minutes, so it won't restart again. The error is above.")
+            input("Press Enter to close...")
+            return
+        print(f"\nFortnite Chaos stopped unexpectedly (code {code}). Restarting in 2 seconds...")
+        time.sleep(2)
+        restarted = True
+
+
 if __name__ == "__main__":
-    main()
+    supervise()

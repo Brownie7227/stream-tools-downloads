@@ -28,7 +28,7 @@ function Get-Http($url) {
 
 function Scripts($pattern) {
     Get-CimInstance Win32_Process -Filter "Name like 'python%' or Name = 'node.exe'" |
-        Where-Object { $_.CommandLine -match $pattern } | Sort-Object CreationDate
+        Where-Object { $_.CommandLine -match $pattern -and $_.CommandLine -notmatch '--child' } | Sort-Object CreationDate
 }
 
 Write-Host ''

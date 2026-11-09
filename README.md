@@ -41,6 +41,9 @@ because it can hold your Discord token.
 | `reports_folder` | Where reports and logs go. Blank uses `Stream Reports` here |
 | `clips_folder` | Where clips go. Blank uses `Clips` here |
 | `recordings_folders` | Extra folders with your stream recordings, as well as `Videos` |
+| `gift_power` | Makes a gift's effects last longer, like `{"Rose": 1, "Galaxy": 3}` |
+| `menu_every_minutes` | How often the gift menu shows itself. 0 turns it off |
+| `vote_every_minutes` | How often chat votes on an effect. 0 turns it off. Needs chat sent to `/chat` |
 | `gift_icons` | Which gift picture shows beside an effect, like `{"random": "rose.png"}` |
 | `apps` | The apps `Start Stream.bat` opens and `End Stream.bat` offers to close |
 | `start_stream` | Whether `Start Stream.bat` runs Fortnite Chaos and Game Boost |

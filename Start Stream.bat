@@ -22,7 +22,7 @@ function Get-StreamApps {
 }
 
 function Scripts($pattern) {
-    Get-CimInstance Win32_Process -Filter "Name like 'python%' or Name = 'node.exe'" | Where-Object { $_.CommandLine -match $pattern }
+    Get-CimInstance Win32_Process -Filter "Name like 'python%' or Name = 'node.exe'" | Where-Object { $_.CommandLine -match $pattern -and $_.CommandLine -notmatch '--child' }
 }
 
 function Start-App($process, $shortcut, $label) {
@@ -49,9 +49,6 @@ if (Test-Path (Join-Path $env:LOCALAPPDATA 'GameBoost\paused-services.txt')) {
 # make reports for any past streams that don't have one yet (quietly, in the background)
 Start-Process py -ArgumentList '-3', '-B', "`"$(Join-Path $Programs 'stream_report.py')`"", '--missing' -WindowStyle Hidden
 
-$Apps = @(Get-StreamApps)
-foreach ($app in $Apps) { Start-App $app.process $app.path $app.name }
-
 # the old flashbang.py fights Fortnite Chaos for port 8765 - Fortnite Chaos does the flashbang now
 Scripts 'flashbang\.py' | ForEach-Object { Stop-Process -Id $_.ProcessId -Force; Write-Host '  Closed the old flashbang.py' -ForegroundColor Yellow }
 
@@ -71,6 +68,20 @@ else {
     Start-Process cmd -ArgumentList '/k', "title Fortnite Chaos && cd /d `"$Programs`" && py -3 fortnite_chaos.py"
     Write-Host '  Started Fortnite Chaos' -ForegroundColor Green
 }
+
+# Your apps open once Fortnite Chaos is answering, so LIVE Studio's overlay never loads blank
+if ($Settings.fortnite_chaos -ne $false) {
+    $ready = $false
+    for ($i = 0; $i -lt 30 -and -not $ready; $i++) {
+        try { Invoke-WebRequest 'http://127.0.0.1:8766/status' -UseBasicParsing -TimeoutSec 1 | Out-Null; $ready = $true }
+        catch { Start-Sleep -Milliseconds 500 }
+    }
+    if ($ready) { Write-Host '  Fortnite Chaos is ready' -ForegroundColor Green }
+    else { Write-Host "  Fortnite Chaos isn't answering yet - if the overlay is blank in LIVE Studio, re-save its Link source" -ForegroundColor Yellow }
+}
+
+$Apps = @(Get-StreamApps)
+foreach ($app in $Apps) { Start-App $app.process $app.path $app.name }
 
 # give TikTok LIVE Studio High priority once it's open, so the stream gets the CPU first
 $usesLiveStudio = @($Apps | Where-Object { $_.process -like '*TikTok LIVE Studio*' }).Count -gt 0
