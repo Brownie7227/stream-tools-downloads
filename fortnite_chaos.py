@@ -66,8 +66,8 @@ ON-STREAM TIMER: the overlay shows which effect is running and how long is left.
 ON-STREAM BANNER: the overlay also shows the "who sent what" banner (moves to the top with ?timer=bottom).
 COMBO METER: every gift fills the overlay's bar. COMBO_GOAL gifts inside COMBO_WINDOW seconds fires /chaos.
 CHAT VOTES: send chat messages to /chat (?user=NAME&text=MESSAGE, or a JSON body with the comment). Every
-  vote_every_minutes (config.json, default 5) chat gets 30s to type 1-4 and the winner fires. Votes only start once
-  chat messages are arriving. /vote starts one now.
+  vote_every_minutes (config.json, default 5) chat gets 30s to vote. Rounds swap between 1-4 and 5-8, and the
+  winner is drawn by share of the votes. Votes only start once chat messages are arriving. /vote starts one now.
 GIFT STRENGTH: config.json "gift_power": {"Rose": 1, "Galaxy": 3} makes a gift's effects last that many times longer.
 GIFT MENU: shows itself on the overlay for 12s every menu_every_minutes (config.json, default 5; 0 turns it off).
 CRASHES: if Fortnite Chaos crashes it restarts itself in the same window (it gives up after 5 crashes in 2 minutes).
@@ -219,12 +219,16 @@ LOWHP_SOUND_LENGTH = 8.6  # heartbeat.mp3 restarts after this long
 GIFT_ICONS = stream_config.get("gift_icons", {})
 # ------------------------------------------
 
-CONTROL = {"invert", "rotate", "jumpswap", "noscope", "invertmouse", "sensitivity"}
-SCREEN = {"blind", "fog", "jumpscare", "flashbang", "fakeban", "bsod", "blink", "lowhp", "creeper", "dvd"}
+# Each group in the order the gift menu and test panel list it
+CONTROL_LIST = ["invert", "rotate", "jumpswap", "noscope", "invertmouse", "sensitivity"]
+MOVE_LIST = ["lookdown", "lookup", "spin", "mapspam"]
+SCREEN_LIST = ["blind", "fog", "jumpscare", "flashbang", "fakeban", "bsod", "blink", "lowhp", "creeper", "dvd"]
+CONTROL = set(CONTROL_LIST)
+SCREEN = set(SCREEN_LIST)
 SILENT = {"jumpscare", "flashbang", "fakeban", "bsod"}  # no banner while they run (it would spoil them)
 CREDIT_AFTER = {"fakeban", "bsod"}  # the banner naming the sender comes when these end
 TIMED_SCREEN = {"blink", "lowhp", "creeper", "dvd"}  # screen effects that show a timer on the overlay
-MOVES = {"lookdown", "lookup", "spin", "mapspam"}  # timed, but stack with controls instead of replacing them
+MOVES = set(MOVE_LIST)  # timed, but stack with controls instead of replacing them
 INSTANT = {"emote"}  # one-offs that don't replace anything
 RANDOM_POOL = CONTROL | SCREEN | MOVES | INSTANT
 # Chaos Mode only combines effects from different groups, so they never fight over the same keys
@@ -294,10 +298,13 @@ class RAWINPUT(ctypes.Structure):
 user32 = ctypes.windll.user32 if os.name == "nt" else None
 
 
-def send_key(scan, up):
-    flags = KEYEVENTF_SCANCODE | (KEYEVENTF_KEYUP if up else 0)
-    inp = INPUT(type=1, u=_INPUTUNION(ki=KEYBDINPUT(0, scan, flags, 0, MAGIC)))
+def _send_key_input(vk, scan, flags):
+    inp = INPUT(type=1, u=_INPUTUNION(ki=KEYBDINPUT(vk, scan, flags, 0, MAGIC)))
     user32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(INPUT))
+
+
+def send_key(scan, up):
+    _send_key_input(0, scan, KEYEVENTF_SCANCODE | (KEYEVENTF_KEYUP if up else 0))
 
 
 def send_mouse(flags, dx=0, dy=0):
@@ -309,8 +316,7 @@ def mask_alt():
     """Taps an unused key. When we swallow the F of Ctrl+Alt+F, the game would otherwise see Alt
     pressed and released on its own, which opens the window menu and freezes your movement."""
     for flags in (0, KEYEVENTF_KEYUP):
-        inp = INPUT(type=1, u=_INPUTUNION(ki=KEYBDINPUT(0xE8, 0, flags, 0, MAGIC)))
-        user32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(INPUT))
+        _send_key_input(0xE8, 0, flags)
 
 
 def tap_key(scan, hold=0.05):
@@ -319,19 +325,15 @@ def tap_key(scan, hold=0.05):
     send_key(scan, True)
 
 
-def glide_mouse(dx, dy, seconds, steps=20):
-    """Moves the mouse by (dx, dy) spread over a short time, so the game sees a smooth turn."""
-    done_x = done_y = 0
-    for i in range(1, steps + 1):
-        x, y = round(dx * i / steps), round(dy * i / steps)
-        send_mouse(MOUSEEVENTF_MOVE, x - done_x, y - done_y)
-        done_x, done_y = x, y
-        time.sleep(seconds / steps)
-
-
 # ---------------- is Fortnite the window in front? ----------------
 GAME_PROCESS = "fortniteclient-win64-shipping"  # lower case, start of the .exe name
 focus = {"game": False}
+
+
+def _process_path(k32, h):
+    """The .exe path of an open process handle, or None."""
+    buf, size = ctypes.create_unicode_buffer(520), wt.DWORD(520)
+    return buf.value if k32.QueryFullProcessImageNameW(wt.HANDLE(h), 0, buf, ctypes.byref(size)) else None
 
 
 def _foreground_is_game(hwnd):
@@ -346,10 +348,8 @@ def _foreground_is_game(hwnd):
     if not h:
         return False
     try:
-        buf, size = ctypes.create_unicode_buffer(520), wt.DWORD(520)
-        if not k32.QueryFullProcessImageNameW(wt.HANDLE(h), 0, buf, ctypes.byref(size)):
-            return False
-        return os.path.basename(buf.value).lower().startswith(GAME_PROCESS)
+        path = _process_path(k32, h)
+        return bool(path) and os.path.basename(path).lower().startswith(GAME_PROCESS)
     finally:
         k32.CloseHandle(wt.HANDLE(h))
 
@@ -418,28 +418,15 @@ def _length(name):
 
 # What each effect does while it runs. Effects that act elsewhere (mouse hook, raw mouse,
 # their own thread or the screen) just return an empty dict.
-EFFECTS = {
+EFFECTS = dict.fromkeys(CONTROL | MOVES | SCREEN, dict)
+EFFECTS.update({
     "invert": lambda: {"map": _pairs((W, S), (A, D))},
     "rotate": lambda: {"map": {W: A, A: S, S: D, D: W}},
     "jumpswap": lambda: {"map": _pairs((SPACE, LCTRL))},
-    "noscope": dict,
-    "invertmouse": dict,
     "sensitivity": lambda: {"factor": random.choice(SENSITIVITY_CHOICES)},
-    "lookdown": dict,
-    "lookup": dict,
     "spin": lambda: {"dir": random.choice((-1, 1))},
-    "mapspam": dict,
-    "blind": dict,
-    "fog": dict,
-    "jumpscare": dict,
-    "flashbang": dict,
-    "fakeban": dict,
-    "bsod": dict,
-    "blink": dict,
-    "lowhp": dict,
-    "creeper": dict,
     "dvd": lambda: {"x0": random.random(), "y0": random.random()},  # where on its bounce path it starts
-}
+})
 
 # ---------------- state ----------------
 lock = threading.RLock()
@@ -452,7 +439,7 @@ hotkeys_down = set()  # trigger keys currently held (so key-repeat doesn't re-tr
 held = {}       # physical key -> key we are sending in its place, while it is held down
 passthru = set()  # keys that must behave normally until physically released
 move_lock = {"until": 0.0}  # keys and mouse buttons frozen until this time (forced emote)
-flash = {"count": 0, "ring": None}  # flashbangs so far (the 8765 browser source watches it) + ring .wav path
+flash = {"count": 0, "ring": None, "creeper": None}  # flashbangs so far (the 8765 browser source watches it) + .wav paths
 rbutton = {"blocked": False}  # right-click down was swallowed, so swallow its release too
 hook_thread_id = {"id": 0}
 emote_busy = threading.Lock()
@@ -644,12 +631,18 @@ def add_chat(user, text):
         return int(m.group(1))
 
 
+def _vote_counts():
+    """Votes for each option so far. Call with the lock held."""
+    counts = [0] * len(vote["options"])
+    for choice in vote["votes"].values():
+        counts[choice - 1] += 1
+    return counts
+
+
 def finish_vote():
     """Counts the votes and fires the winner. Returns the winning effect, or None if nobody voted."""
     with lock:
-        counts = [0] * len(vote["options"])
-        for choice in vote["votes"].values():
-            counts[choice - 1] += 1
+        counts = _vote_counts()
         vote["until"] = 0.0
         if not any(counts):
             vote["show_until"] = 0.0
@@ -1051,10 +1044,10 @@ def _app_usage():
         if not h:
             continue
         try:
-            buf, size = ctypes.create_unicode_buffer(520), wt.DWORD(520)
-            if not k32.QueryFullProcessImageNameW(h, 0, buf, ctypes.byref(size)):
+            path = _process_path(k32, h)
+            if not path:
                 continue
-            name = os.path.splitext(os.path.basename(buf.value))[0]
+            name = os.path.splitext(os.path.basename(path))[0]
             t = [wt.FILETIME() for _ in range(4)]
             k32.GetProcessTimes(h, *[ctypes.byref(x) for x in t])
             mem = PROCESS_MEMORY_COUNTERS(cb=ctypes.sizeof(PROCESS_MEMORY_COUNTERS))
@@ -1518,12 +1511,21 @@ def _find_file(name):
     return None
 
 
-def make_ring():
-    """The flashbang's bang + ringing ears, written to a temp .wav once at startup."""
-    import struct
+def _write_wav(filename, sr, frames):
+    """Saves 16-bit mono samples as a temp .wav and returns its path."""
     import tempfile
     import wave
-    path = os.path.join(tempfile.gettempdir(), "fortnite_chaos_ring.wav")
+    path = os.path.join(tempfile.gettempdir(), filename)
+    with wave.open(path, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(sr)
+        w.writeframes(bytes(frames))
+    return path
+
+
+def make_ring():
+    """The flashbang's bang + ringing ears, written to a temp .wav once at startup."""
     sr, dur = 44100, 5.5
     frames = bytearray()
     for i in range(int(sr * dur)):
@@ -1534,20 +1536,11 @@ def make_ring():
             s += random.uniform(-1, 1) * (1 - t / 0.15) * 1.5
         s = max(-1.0, min(1.0, s * env * FLASH_VOLUME))
         frames += struct.pack("<h", int(s * 32767))
-    with wave.open(path, "wb") as w:
-        w.setnchannels(1)
-        w.setsampwidth(2)
-        w.setframerate(sr)
-        w.writeframes(bytes(frames))
-    return path
+    return _write_wav("fortnite_chaos_ring.wav", sr, frames)
 
 
 def make_creeper_sound():
     """The creeper's fuse hiss, then the boom, written to a temp .wav once at startup."""
-    import struct
-    import tempfile
-    import wave
-    path = os.path.join(tempfile.gettempdir(), "fortnite_chaos_creeper.wav")
     sr, dur = 22050, CREEPER_FUSE + 1.4
     frames = bytearray()
     low = 0.0
@@ -1561,12 +1554,7 @@ def make_creeper_sound():
             low += (noise - low) * 0.06
             s = (low * 5 + noise * max(0.0, 0.5 - b * 2.5)) * math.exp(-b * 3.2)
         frames += struct.pack("<h", int(max(-1.0, min(1.0, s)) * 32767 * 0.8))
-    with wave.open(path, "wb") as w:
-        w.setnchannels(1)
-        w.setsampwidth(2)
-        w.setframerate(sr)
-        w.writeframes(bytes(frames))
-    return path
+    return _write_wav("fortnite_chaos_creeper.wav", sr, frames)
 
 
 # Gift pictures (assets\\gifts), found by gift name: "Tiny Diny" finds 002_Tiny_Diny.png
@@ -1624,6 +1612,11 @@ def dvd_pos(elapsed, x0, y0):
 def lowhp_pulse(elapsed):
     """Heart pulse: jumps to 1 on each beat, then fades."""
     return math.exp(-(elapsed % LOWHP_BEAT) * 4)
+
+
+# The creeper's 8x8 face, drawn the same on your screen and on the overlay
+CREEPER_FACE = ("GGLGGDGG", "GLGDGGLG", "GKKGGKKD", "DKKGLKKG", "GGDKKGGL", "LGKKKKGG", "GGKKKKDG", "GDKGGKGL")
+CREEPER_COLORS = {"G": "#4fa63c", "L": "#6cc24a", "D": "#3b8430", "K": "#111111"}
 
 
 def flash_alpha(left, total):
@@ -1764,8 +1757,7 @@ function lid(el,a,top){
   for(let i=16;i>=0;i--){const x=i/16,y=a*55*(1+.45*Math.pow(2*x-1,2));pts.push(x*100+'% '+(top?y:100-y)+'%');}
   el.style.clipPath='polygon('+pts.join(',')+')';
 }
-const FACE=['GGLGGDGG','GLGDGGLG','GKKGGKKD','DKKGLKKG','GGDKKGGL','LGKKKKGG','GGKKKKDG','GDKGGKGL'];
-const FC={G:'#4fa63c',L:'#6cc24a',D:'#3b8430',K:'#111'};
+const FACE=__FACE__,FC=__FC__;
 function drawFace(){
   const c=$('face');c.width=innerWidth;c.height=innerHeight;const x=c.getContext('2d'),s=Math.floor(innerHeight*.7/8),ox=(innerWidth-s*8)/2,oy=(innerHeight-s*8)/2;
   FACE.forEach((r,j)=>[...r].forEach((ch,i)=>{x.fillStyle=FC[ch];x.fillRect(ox+i*s,oy+j*s,s,s);}));
@@ -1893,7 +1885,8 @@ poll();
     "__BLAST__", str(CREEPER_BLAST)).replace("__CRATER__", str(CREEPER_HOLE)).replace(
     "__BAN_TITLE__", FAKE_BAN_TITLE).replace("__BAN_TEXT__", FAKE_BAN_TEXT).replace(
     "DVDW", str(round(DVD_SIZE * 100))).replace("DVDSX", str(DVD_SPEED[0])).replace(
-    "DVDSY", str(DVD_SPEED[1])).replace("DVDC", json.dumps(DVD_COLORS))
+    "DVDSY", str(DVD_SPEED[1])).replace("DVDC", json.dumps(DVD_COLORS)).replace(
+    "__FACE__", json.dumps(CREEPER_FACE)).replace("__FC__", json.dumps(CREEPER_COLORS))
 OVERLAY_VERSION = hashlib.md5(OVERLAY_HTML.encode("utf-8")).hexdigest()[:10]  # overlays reload when this changes
 
 
@@ -1943,10 +1936,7 @@ def overlay_state():
             menu_show["next"] = now + every_menu * 60
         voting = None
         if now < vote["until"] or now < vote["show_until"]:
-            counts = [0] * len(vote["options"])
-            for choice in vote["votes"].values():
-                counts[choice - 1] += 1
-            voting = {"id": vote["id"], "options": [SHORT_NAMES.get(o, o) for o in vote["options"]], "counts": counts,
+            voting = {"id": vote["id"], "options": [SHORT_NAMES.get(o, o) for o in vote["options"]], "counts": _vote_counts(),
                       "left": max(0.0, round(vote["until"] - now, 1)), "winner": vote["winner"], "first": vote["first"]}
         menu_list = None
         if menu["on"] or now < menu_show["until"]:
@@ -1961,9 +1951,9 @@ def overlay_state():
 
 
 MENU_GROUPS = [
-    ("Controls", ["invert", "rotate", "jumpswap", "noscope", "invertmouse", "sensitivity"]),
-    ("Aim + map", ["lookdown", "lookup", "spin", "mapspam", "emote"]),
-    ("Screen", ["blind", "fog", "jumpscare", "flashbang", "fakeban", "bsod", "blink", "lowhp", "creeper", "dvd"]),
+    ("Controls", CONTROL_LIST),
+    ("Aim + map", MOVE_LIST + ["emote"]),
+    ("Screen", SCREEN_LIST),
     ("Specials", ["random", "chaos"]),
 ]
 GROUP_COLORS = ["#ff3b5c", "#ffb020", "#3fd0ff", "#9b6bff"]  # gift menu sections, in order (red, gold, blue, purple)
@@ -2004,10 +1994,10 @@ def _menu_secs(n):
 
 
 PANEL_GROUPS = [
-    ("Controls", ["invert", "rotate", "jumpswap", "noscope", "invertmouse", "sensitivity"]),
-    ("Aim + map", ["lookdown", "lookup", "spin", "mapspam"]),
+    ("Controls", CONTROL_LIST),
+    ("Aim + map", MOVE_LIST),
     ("One-offs", ["emote"]),
-    ("Screen", ["blind", "fog", "jumpscare", "flashbang", "fakeban", "bsod", "blink", "lowhp", "creeper", "dvd"]),
+    ("Screen", SCREEN_LIST),
     ("Specials", ["random", "wheel", "chaos"]),
     ("Overlay", ["menu", "topsender"]),
     ("Chat vote", ["vote", "chat?user=Test&text=1"]),
@@ -2166,58 +2156,64 @@ def _find(obj, key):
     return None
 
 
-def _from_body(body):
-    if not body:
-        return None, None
+def _parse(body):
+    """A webhook's JSON body, or None if it has none."""
     try:
-        data = json.loads(body.decode("utf-8", "ignore"))
-    except Exception:
+        return json.loads(body.decode("utf-8", "ignore")) if body else None
+    except ValueError:
+        return None
+
+
+def _first(data, keys):
+    """The first of these keys found in the parsed body, or None."""
+    return next((r for r in (_find(data, k) for k in keys) if r), None)
+
+
+def _from_body(body):
+    data = _parse(body)
+    if data is None:
         return None, None
     # BetterTok's "username" is the creator's handle, so the viewer's own fields come first
-    who = next((r for r in (_find(data, k) for k in ("nickname", "displayname", "display_name", "viewer_username",
-                                                     "uniqueid", "username", "user")) if r), None)
-    gift = next((r for r in (_find(data, k) for k in ("giftname", "gift_name", "gift")) if r), None)
+    who = _first(data, ("nickname", "displayname", "display_name", "viewer_username", "uniqueid", "username", "user"))
+    gift = _first(data, ("giftname", "gift_name", "gift"))
     return who, gift
 
 
 def _viewer_names(body, who):
     """The viewer's id, @handle and names in a webhook body, for spotting the same viewer twice.
     Not "username": in BetterTok's events that's the creator's own handle, the same for every viewer."""
-    names = [who]
-    try:
-        parsed = json.loads(body.decode("utf-8", "ignore")) if body else {}
-        names += [_find(parsed, k) for k in ("viewer_id", "viewer_username", "display_name", "nickname",
-                                             "displayname", "uniqueid")]
-    except ValueError:
-        pass
-    creator = _creator_handle(body)
+    parsed = _parse(body)
+    names = [who] + [_find(parsed, k) for k in ("viewer_id", "viewer_username", "display_name", "nickname",
+                                                "displayname", "uniqueid")]
+    creator = _creator_handle(parsed)
     return [n for n in names if n and str(n).strip().lower() != creator]
 
 
 def _looks_like_follow(body):
     """True if a webhook body says it's a follow (its type/event names one)."""
-    try:
-        parsed = json.loads(body.decode("utf-8", "ignore"))
-    except ValueError:
-        return False
+    parsed = _parse(body)
     kind = " ".join(str(_find(parsed, k) or "") for k in ("type", "event", "event_type", "eventtype", "trigger"))
     return "follow" in kind.lower()
 
 
-def _creator_handle(body):
-    """The creator's @handle in a BetterTok webhook body (lower case), or ""."""
-    try:
-        data = json.loads(body.decode("utf-8", "ignore")) if body else None
-    except ValueError:
+def _creator_handle(parsed):
+    """The creator's @handle in a parsed BetterTok webhook body (lower case), or ""."""
+    if not (_find(parsed, "viewer_username") or _find(parsed, "viewer_id")):  # not BetterTok's shape: username is the viewer
         return ""
-    if not (_find(data, "viewer_username") or _find(data, "viewer_id")):  # not BetterTok's shape: username is the viewer
-        return ""
-    return str(_find(data, "username") or "").strip().lower()
+    return str(_find(parsed, "username") or "").strip().lower()
 
 
-ROUTES = sorted(CONTROL | SCREEN | MOVES | INSTANT) + ["random", "wheel", "chaos", "off", "status", "menu", "topsender",
-                                                      "chat", "vote", "follow"]
-ACTIVATE_ROUTES = set(ROUTES) - {"off", "status", "menu", "topsender", "chat", "vote", "follow"}
+OTHER_ROUTES = ["off", "status", "menu", "topsender", "chat", "vote", "follow"]  # routes that don't fire an effect
+ROUTES = sorted(RANDOM_POOL) + ["random", "wheel", "chaos"] + OTHER_ROUTES
+ACTIVATE_ROUTES = set(ROUTES) - set(OTHER_ROUTES)
+
+
+# Files the overlay and panel load: address -> (file name, type, what to say if it's missing)
+ASSET_FILES = {
+    "font.ttf": ("LuckiestGuy-Regular.ttf", "font/ttf", "no LuckiestGuy-Regular.ttf"),  # gift menu and panel headings
+    "fakeban_bg.png": ("fakeban_bg.png", "image/png", "no fakeban_bg.png"),
+    "jumpscare.png": ("jumpscare.png", "image/png", "put jumpscare.png next to fortnite_chaos.py"),
+}
 
 
 class ChaosServer(ThreadingHTTPServer):
@@ -2261,24 +2257,13 @@ class Handler(BaseHTTPRequestHandler):
                 return self._reply(404, {"error": "no such gift picture"})
             with open(os.path.join(GIFTS_DIR, file), "rb") as f:
                 return self._send(200, f.read(), "image/png")
-        if name == "font.ttf":  # Luckiest Guy, for the gift menu and panel headings
-            path = _find_file("LuckiestGuy-Regular.ttf")
+        if name in ASSET_FILES:
+            file, ctype, missing = ASSET_FILES[name]
+            path = _find_file(file)
             if not path:
-                return self._reply(404, {"error": "no LuckiestGuy-Regular.ttf"})
+                return self._reply(404, {"error": missing})
             with open(path, "rb") as f:
-                return self._send(200, f.read(), "font/ttf")
-        if name == "fakeban_bg.png":
-            path = _find_file("fakeban_bg.png")
-            if not path:
-                return self._reply(404, {"error": "no fakeban_bg.png"})
-            with open(path, "rb") as f:
-                return self._send(200, f.read(), "image/png")
-        if name == "jumpscare.png":
-            path = _find_file("jumpscare.png")
-            if not path:
-                return self._reply(404, {"error": "put jumpscare.png next to fortnite_chaos.py"})
-            with open(path, "rb") as f:
-                return self._send(200, f.read(), "image/png")
+                return self._send(200, f.read(), ctype)
         q = parse_qs(u.query)
         secs = None
         try:
@@ -2304,13 +2289,9 @@ class Handler(BaseHTTPRequestHandler):
         elif name == "chat":
             user = (q.get("user") or q.get("nickname") or [""])[0]
             text = (q.get("text") or q.get("comment") or q.get("message") or [""])[0]
-            if body and not text:
-                try:
-                    parsed = json.loads(body.decode("utf-8", "ignore"))
-                    text = next((_find(parsed, k) for k in ("comment", "message", "text", "content") if _find(parsed, k)), "")
-                    user = user or (b_who if (b_who := _from_body(body)[0]) else "")
-                except ValueError:
-                    pass
+            if body and not text and (parsed := _parse(body)) is not None:
+                text = _first(parsed, ("comment", "message", "text", "content")) or ""
+                user = user or b_who or ""
             self._reply(200, {"ok": True, "voted": add_chat(_clean(user), text)})
         elif name == "vote":
             self._reply(200, {"ok": True, "options": start_vote()})
@@ -2679,11 +2660,10 @@ def run_popups():
     face.pack()
     px = int(sh * .7 / 8)
     fx0, fy0 = (sw - px * 8) // 2, (sh - px * 8) // 2
-    for j, row in enumerate(("GGLGGDGG", "GLGDGGLG", "GKKGGKKD", "DKKGLKKG", "GGDKKGGL", "LGKKKKGG", "GGKKKKDG",
-                             "GDKGGKGL")):
+    for j, row in enumerate(CREEPER_FACE):
         for i, ch in enumerate(row):
             face.create_rectangle(fx0 + i * px, fy0 + j * px, fx0 + (i + 1) * px, fy0 + (j + 1) * px, outline="",
-                                  fill={"G": "#4fa63c", "L": "#6cc24a", "D": "#3b8430", "K": "#111111"}[ch])
+                                  fill=CREEPER_COLORS[ch])
     fuse_flash = face.create_rectangle(fx0, fy0, fx0 + px * 8, fy0 + px * 8, fill="#ffffff", outline="", state="hidden")
     blast = face.create_rectangle(0, 0, sw, sh, fill="#ffffff", outline="", state="hidden")
     crater = tk.Canvas(wins["creeper"], width=sw, height=sh, bg=KEY, highlightthickness=0)
@@ -2830,7 +2810,7 @@ def run_popups():
                 now = time.time()
                 want = {n: (data.get(n), active[n] - now) for n in SCREEN & set(active)}
                 flash_total = totals.get("flashbang", 1)
-                spent = {n: totals[n] - (active[n] - now) for n in ("blink", "lowhp", "creeper", "dvd") if n in active}
+                spent = {n: totals[n] - (active[n] - now) for n in TIMED_SCREEN & set(active)}
             for n in list(screens):
                 if n not in want:
                     stop_screen(n)
@@ -2906,7 +2886,6 @@ def main():
     try:
         flash["creeper"] = make_creeper_sound()
     except Exception:
-        flash["creeper"] = None
         log("WARNING: couldn't make the creeper sound")
     _load_gift_files()
 
