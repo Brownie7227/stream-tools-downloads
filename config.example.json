@@ -1,6 +1,12 @@
 {
   "discord_token": "INSERT_YOUR_DISCORD_BOT_TOKEN_HERE",
   "discord_channel_id": "INSERT_YOUR_DISCORD_CHANNEL_ID_HERE",
+  "bettertok_api_key": "INSERT_YOUR_BETTERTOK_DEVELOPER_API_KEY_HERE",
+  "bettertok_gifts": {
+    "Heart Me": "random",
+    "Sunglasses": "random"
+  },
+  "bettertok_follow": "random",
   "reports_folder": "",
   "clips_folder": "",
   "recordings_folders": [],

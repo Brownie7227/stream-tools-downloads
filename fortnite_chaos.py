@@ -1172,13 +1172,14 @@ def _discord_react(token, channel, message, emoji):
 class _Websocket:
     """Just enough of a websocket client for Discord's gateway. Everything runs on one thread."""
 
-    def __init__(self, host, path):
+    def __init__(self, host, path, headers=None):
         raw = socket.create_connection((host, 443), timeout=15)
         self.sock = ssl.create_default_context().wrap_socket(raw, server_hostname=host)
         key = base64.b64encode(os.urandom(16)).decode()
+        extra = "".join(f"{k}: {v}\r\n" for k, v in (headers or {}).items())
         self.sock.sendall((f"GET {path} HTTP/1.1\r\nHost: {host}\r\nUpgrade: websocket\r\n"
                            f"Connection: Upgrade\r\nSec-WebSocket-Key: {key}\r\n"
-                           "Sec-WebSocket-Version: 13\r\n\r\n").encode())
+                           f"Sec-WebSocket-Version: 13\r\n{extra}\r\n").encode())
         head = b""
         while b"\r\n\r\n" not in head:
             chunk = self.sock.recv(4096)
@@ -1330,6 +1331,102 @@ def discord_bot():
             log(f"{time.strftime('%H:%M:%S')} - Discord: {e.args[0] if e.args else e} - reconnecting in {wait}s")
         time.sleep(wait)
         wait = min(wait * 2, 60)  # back off while Discord can't be reached
+
+
+# ---------------- BetterTok Developer API (live TikTok events, straight from BetterTok) ----------------
+# Replaces the BetterTok webhook actions: no "one rule per event" or switched-off action can get in the way.
+# config.json:  "bettertok_api_key": "btk_live_...",                 (Developer tab > Keys)
+#               "bettertok_gifts": {"Heart Me": "random", "Sunglasses": "random"},   gift name -> effect
+#               "bettertok_follow": "random"                        effect for a follow ("" = nothing)
+BETTERTOK_HOST = "api.bettertok.app"
+BETTERTOK_PATH = "/api/v1/developer/stream"
+BETTERTOK_MAX_PER_COMBO = 5     # a 10x combo fires this many effects at most...
+BETTERTOK_COMBO_GAP = 1.5       # ...this many seconds apart
+bettertok_status = {"state": "off"}
+_bettertok_seen = []            # recent event ids, so a resent event never fires twice
+
+
+def _bettertok_effect(route):
+    route = str(route or "").strip().strip("/").lower()
+    return route if route in ACTIVATE_ROUTES else None
+
+
+def _bettertok_event(evt):
+    """One event from the stream: fire what config.json says for it."""
+    if not isinstance(evt, dict) or not isinstance(evt.get("data"), dict):
+        return
+    if evt.get("id"):
+        if evt["id"] in _bettertok_seen:
+            return
+        _bettertok_seen.append(evt["id"])
+        del _bettertok_seen[:-200]
+    kind, d = evt.get("type"), evt["data"]
+    who = d.get("display_name") or d.get("viewer_username") or ""
+    if kind == "gift":
+        gifts = stream_config.get("bettertok_gifts", {})
+        gift = d.get("gift_name") or ""
+        route = next((r for g, r in (gifts.items() if isinstance(gifts, dict) else [])
+                      if _gift_key(str(g)) == _gift_key(gift)), None)
+        name = _bettertok_effect(route)
+        if not name:
+            return
+        try:
+            count = int(d.get("gift_count") or 1)
+        except (TypeError, ValueError):
+            count = 1
+        for i in range(max(1, min(count, BETTERTOK_MAX_PER_COMBO))):  # one effect per gift in the combo
+            threading.Timer(i * BETTERTOK_COMBO_GAP, activate, (name, None, who, gift)).start()
+    elif kind == "follow":
+        name = _bettertok_effect(stream_config.get("bettertok_follow", ""))
+        if name:  # a follow isn't a gift: no combo meter, no top sender
+            threading.Thread(target=activate, args=(name, None, who, "a follow"),
+                             kwargs={"counted": False}, daemon=True).start()
+    elif kind == "comment":
+        add_chat(_clean(who), d.get("comment") or "")  # chat votes
+
+
+def _bettertok_session(key):
+    ws = _Websocket(BETTERTOK_HOST, BETTERTOK_PATH, {"Authorization": f"Bearer {key}"})
+    try:
+        started = time.time()
+        while True:
+            msg = ws.recv()
+            if isinstance(msg, dict) and msg.get("type") == "error":  # e.g. {"code": "UNAUTHORIZED", ...}
+                raise ConnectionError(msg.get("message") or "BetterTok sent an error", msg.get("code"))
+            # a bad key is refused straight after connecting, so only say "connected" once that's passed
+            if bettertok_status["state"] != "connected" and (msg is not None or time.time() - started > 3):
+                bettertok_status["state"] = "connected"
+                log("BetterTok: connected to your live events")
+            if msg is not None:
+                _bettertok_event(msg)
+    finally:
+        ws.close()
+
+
+def bettertok_events():
+    key = stream_config.get("bettertok_api_key")
+    if not key:
+        log("  note: no bettertok_api_key in config.json, gifts and follows only come in through BetterTok webhooks")
+        return
+    wait = 5
+    while True:
+        bettertok_status["state"] = "connecting"
+        try:
+            _bettertok_session(key)
+        except Exception as e:
+            text = str(e.args[0] if e.args else e)
+            code = e.args[1] if isinstance(e, ConnectionError) and len(e.args) > 1 else None
+            if code in ("UNAUTHORIZED", "FORBIDDEN", 1008) or " 401 " in text or " 403 " in text:
+                bettertok_status["state"] = "error"
+                log("BetterTok: the API key was rejected - make a new one in BetterTok's Developer tab"
+                    " and put it in config.json as bettertok_api_key")
+                return
+            if bettertok_status["state"] == "connected":
+                wait = 5
+            bettertok_status["state"] = "reconnecting"
+            log(f"{time.strftime('%H:%M:%S')} - BetterTok: {text} - reconnecting in {wait}s")
+        time.sleep(wait)
+        wait = min(wait * 2, 60)
 
 
 # ---------------- viewer overlay (browser source) ----------------
@@ -1901,9 +1998,13 @@ class Handler(BaseHTTPRequestHandler):
             with lock:
                 now = time.time()
                 self._reply(200, {"active": {n: max(0, round(e - now)) for n, e in active.items()},
-                                  "discord": discord_status["state"]})
+                                  "discord": discord_status["state"], "bettertok": bettertok_status["state"]})
         elif name in ACTIVATE_ROUTES:
-            self._reply(200, {"ok": True, "effect": activate(name, secs, who, gift)})
+            # BetterTok webhooks always send a JSON body, and only gift events name a gift. So a body
+            # without a gift is a follow, share or likes goal: it fires the effect but doesn't fill the
+            # combo meter or count as a top sender. Plain links with no body (TikFinity, the panel) count as before.
+            is_gift = not body or bool(gift)
+            self._reply(200, {"ok": True, "effect": activate(name, secs, who, gift, counted=is_gift)})
         else:
             self._reply(404, {"routes": ROUTES})
 
@@ -2458,6 +2559,7 @@ def main():
     threading.Thread(target=focus_watcher, daemon=True).start()
     threading.Thread(target=memory_watcher, daemon=True).start()
     threading.Thread(target=discord_bot, daemon=True).start()
+    threading.Thread(target=bettertok_events, daemon=True).start()
     threading.Thread(target=vote_loop, daemon=True).start()
     threading.Thread(target=server.serve_forever, daemon=True).start()
     try:

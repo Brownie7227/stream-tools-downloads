@@ -1,5 +1,6 @@
 """
-The setup window: pick which apps Start Stream opens and where your files go. Saves to config.json.
+The setup window: pick which apps Start Stream opens, where your files go, and the optional Discord and
+BetterTok connections. Saves to config.json.
 
 Run it again any time to change your choices:  py -3 setup_wizard.py
 See what's set up, changing nothing:           py -3 setup_wizard.py --check
@@ -11,6 +12,7 @@ import os
 import shutil
 import subprocess
 import sys
+import webbrowser
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(HERE, "config.json")
@@ -120,7 +122,21 @@ def guess_process(name, path, resolve=shortcut_target):
     return name
 
 
-def build_config(existing, apps, chaos, boost, clips, reports, recordings, token, channel):
+ACCENT = "#e5385f"  # the window's header colour
+BETTERTOK_DEFAULT_GIFTS = "Heart Me, Sunglasses"
+BETTERTOK_KEYS_URL = "https://bettertok.app/dashboard/creator/developer"
+
+
+def random_gifts(config):
+    """The gifts set to fire a random effect, as the comma-separated text the window shows."""
+    gifts = config.get("bettertok_gifts")
+    if not isinstance(gifts, dict):
+        return BETTERTOK_DEFAULT_GIFTS
+    return ", ".join(g for g, effect in gifts.items() if str(effect).strip("/").lower() == "random")
+
+
+def build_config(existing, apps, chaos, boost, clips, reports, recordings, token, channel,
+                 bettertok_key=None, bettertok_gifts=None, bettertok_follow=None):
     """The new config.json. Anything not on this window is kept as it was."""
     config = dict(existing)
     config["apps"] = apps
@@ -130,6 +146,18 @@ def build_config(existing, apps, chaos, boost, clips, reports, recordings, token
     config["recordings_folders"] = [r for r in recordings if r.strip()]
     config["discord_token"] = token.strip()
     config["discord_channel_id"] = channel.strip()
+    if bettertok_key is not None:
+        config["bettertok_api_key"] = bettertok_key.strip()
+    if bettertok_gifts is not None:
+        # gifts set by hand to a particular effect (not "random") are kept as they are
+        old = existing.get("bettertok_gifts") if isinstance(existing.get("bettertok_gifts"), dict) else {}
+        gifts = {g: e for g, e in old.items() if str(e).strip("/").lower() != "random"}
+        for name in bettertok_gifts.split(","):
+            if name.strip() and name.strip().lower() not in (g.lower() for g in gifts):
+                gifts[name.strip()] = "random"
+        config["bettertok_gifts"] = gifts
+    if bettertok_follow is not None:
+        config["bettertok_follow"] = "random" if bettertok_follow else ""
     return config
 
 
@@ -194,6 +222,12 @@ def check_setup(path=CONFIG_PATH):
     has_token = is_set(config.get("discord_token")) or saved_token_file()
     channel = is_set(config.get("discord_channel_id"))
     lines.append("[OK] Discord jumpscare: " + ("set up" if has_token and channel else "off"))
+    if is_set(config.get("bettertok_api_key")):
+        gifts = random_gifts(config) or "no gifts"
+        follow = "follows too" if str(config.get("bettertok_follow", "")).strip() else "not follows"
+        lines.append(f"[OK] BetterTok live events: on ({gifts}; {follow})")
+    else:
+        lines.append("[OK] BetterTok live events: off (gifts only come in through webhooks)")
     return ready, lines
 
 
@@ -209,26 +243,64 @@ class Wizard:
 
         self.root = root = tk.Tk()
         root.title("Stream Tools setup")
-        root.minsize(760, 0)
-        main = ttk.Frame(root, padding=16)
-        main.pack(fill="both", expand=True)
-        main.columnconfigure(0, weight=1)
-        self.main = main
+        root.minsize(780, 0)
+        self._style()
+
+        header = tk.Frame(root, bg=ACCENT, padx=22, pady=14)
+        header.pack(fill="x")
+        tk.Label(header, text="Stream Tools setup", bg=ACCENT, fg="white", font=("Segoe UI Semibold", 16)).pack(anchor="w")
+        tk.Label(header, text="Choose what Start Stream opens, where your files go and what Fortnite Chaos connects to.",
+                 bg=ACCENT, fg="#ffd9e2", font=("Segoe UI", 10)).pack(anchor="w")
+
+        tabs = ttk.Notebook(root, padding=(16, 14, 16, 0))
+        tabs.pack(fill="both", expand=True)
+        self.tabs = tabs
+        self.main = self._page("  Apps  ")
         self._apps_section()
         self._tools_section()
+        self.main = self._page("  Files  ")
         self._folders_section()
+        self.main = self._page("  Connections  ")
+        self._bettertok_section()
         self._discord_section()
-        buttons = ttk.Frame(main)
-        buttons.grid(sticky="e", pady=(14, 0))
+
+        ttk.Separator(root).pack(fill="x", pady=(14, 0))
+        buttons = ttk.Frame(root, padding=(16, 10, 16, 14))
+        buttons.pack(fill="x")
+        ttk.Label(buttons, text="Nothing changes until you click Save. Your last settings are kept as config.json.bak.",
+                  style="Hint.TLabel").pack(side="left")
         ttk.Button(buttons, text="Cancel", command=root.destroy).pack(side="right", padx=(8, 0))
-        ttk.Button(buttons, text="Save", command=self.save).pack(side="right")
+        ttk.Button(buttons, text="Save", style="Accent.TButton", command=self.save).pack(side="right")
+        root.bind("<Escape>", lambda e: root.destroy())
+
+    def _style(self):
+        s = self.ttk.Style(self.root)
+        base = ("Segoe UI", 10)
+        self.root.option_add("*Font", base)
+        s.configure(".", font=base)
+        s.configure("TLabelframe.Label", font=("Segoe UI Semibold", 10), foreground="#222222")
+        s.configure("TLabelframe", padding=12)
+        s.configure("Hint.TLabel", foreground="#6b6b6b")
+        s.configure("Warn.TLabel", foreground="#9a5b00")
+        s.configure("Good.TLabel", foreground="#1e7d3a", font=("Segoe UI Semibold", 10))
+        s.configure("Off.TLabel", foreground="#8a8a8a", font=("Segoe UI Semibold", 10))
+        s.configure("Accent.TButton", font=("Segoe UI Semibold", 10), padding=(18, 4))
+        s.configure("TButton", padding=(12, 4))
+        s.configure("TNotebook.Tab", padding=(14, 6), font=("Segoe UI Semibold", 10))
+
+    def _page(self, title):
+        page = self.ttk.Frame(self.tabs, padding=(4, 12, 4, 4))
+        page.columnconfigure(0, weight=1)
+        self.tabs.add(page, text=title)
+        return page
 
     def _section(self, title, note=None):
-        box = self.ttk.LabelFrame(self.main, text=title, padding=10)
-        box.grid(sticky="ew", pady=(0, 10))
+        box = self.ttk.LabelFrame(self.main, text=title)
+        box.grid(sticky="ew", pady=(0, 12))
         box.columnconfigure(0, weight=1)
         if note:
-            self.ttk.Label(box, text=note, foreground="#555555").grid(sticky="w", pady=(0, 6), columnspan=3)
+            self.ttk.Label(box, text=note, style="Hint.TLabel", justify="left").grid(
+                sticky="w", pady=(0, 8), columnspan=3)
         return box
 
     # ---- apps
@@ -318,8 +390,8 @@ class Wizard:
     def _folder_row(self, box, row, label, key, default_name):
         value = self.config.get(key)
         var = self.tk.StringVar(value=value if is_set(value) else os.path.join(HERE, default_name))
-        self.ttk.Label(box, text=label).grid(row=row, column=0, sticky="w", columnspan=2)
-        self.ttk.Entry(box, textvariable=var).grid(row=row + 1, column=0, sticky="ew")
+        self.ttk.Label(box, text=label).grid(row=row, column=0, sticky="w", columnspan=2, pady=(0 if row == 0 else 10, 2))
+        self.ttk.Entry(box, textvariable=var).grid(row=row + 1, column=0, sticky="ew", ipady=2)
         self.ttk.Button(box, text="Browse...", command=lambda: self._browse_folder(var)).grid(
             row=row + 1, column=1, padx=(8, 0))
         return var
@@ -332,11 +404,12 @@ class Wizard:
     def _folders_section(self):
         tk, ttk = self.tk, self.ttk
         box = self._section("Where your files go")
-        self.clips = self._folder_row(box, 0, "Chaos Clips saves clips to:", "clips_folder", "Clips")
-        self.reports = self._folder_row(box, 2, "Stream reports and logs go to:", "reports_folder", "Stream Reports")
-        ttk.Label(box, text="Extra folders with your stream recordings (your Videos folder is always checked):").grid(
-            row=4, column=0, sticky="w", columnspan=2, pady=(6, 0))
-        self.recordings = tk.Listbox(box, height=2, activestyle="none")
+        self.clips = self._folder_row(box, 0, "Chaos Clips saves clips to", "clips_folder", "Clips")
+        self.reports = self._folder_row(box, 2, "Stream reports and logs go to", "reports_folder", "Stream Reports")
+        ttk.Label(box, text="Extra folders with your stream recordings (your Videos folder is always checked)").grid(
+            row=4, column=0, sticky="w", columnspan=2, pady=(10, 2))
+        self.recordings = tk.Listbox(box, height=3, activestyle="none", relief="solid", borderwidth=1,
+                                     highlightthickness=0)
         self.recordings.grid(row=5, column=0, sticky="ew")
         saved = self.config.get("recordings_folders")
         for folder in saved if isinstance(saved, list) else []:
@@ -366,10 +439,59 @@ class Wizard:
         channel = self.config.get("discord_channel_id")
         self.token = self.tk.StringVar(value=token if is_set(token) else "")
         self.channel = self.tk.StringVar(value=channel if is_set(channel) else "")
-        self.ttk.Label(box, text="Bot token:").grid(sticky="w")
-        self.ttk.Entry(box, textvariable=self.token, show="*").grid(sticky="ew")
-        self.ttk.Label(box, text="Channel ID:").grid(sticky="w", pady=(6, 0))
-        self.ttk.Entry(box, textvariable=self.channel).grid(sticky="ew")
+        self.ttk.Label(box, text="Bot token").grid(sticky="w")
+        self.ttk.Entry(box, textvariable=self.token, show="•").grid(sticky="ew", ipady=2)
+        self.ttk.Label(box, text="Channel ID").grid(sticky="w", pady=(8, 0))
+        self.ttk.Entry(box, textvariable=self.channel).grid(sticky="ew", ipady=2)
+
+    # ---- bettertok
+    def _bettertok_section(self):
+        tk, ttk = self.tk, self.ttk
+        box = self._section(
+            "BetterTok live events  (optional, BetterTok Creator plan)",
+            "Fortnite Chaos gets your gifts, follows and chat straight from BetterTok, with no webhook actions.\n"
+            "1.  Click Get a key, then Create a key, and copy it. BetterTok only shows it once.\n"
+            "2.  Paste it below, pick your gifts and click Save. Leave it blank to keep using webhooks.")
+        key = self.config.get("bettertok_api_key")
+        self.bt_key = tk.StringVar(value=key if is_set(key) else "")
+        self.bt_gifts = tk.StringVar(value=random_gifts(self.config))
+        self.bt_follow = tk.BooleanVar(value=str(self.config.get("bettertok_follow", "random")).strip() != "")
+
+        row = ttk.Frame(box)
+        row.grid(sticky="ew", columnspan=3)
+        row.columnconfigure(1, weight=1)
+        ttk.Label(row, text="API key").grid(row=0, column=0, padx=(0, 10))
+        entry = ttk.Entry(row, textvariable=self.bt_key, show="•")
+        entry.grid(row=0, column=1, sticky="ew", ipady=2)
+        shown = tk.BooleanVar(value=False)
+        ttk.Checkbutton(row, text="Show", variable=shown,
+                        command=lambda: entry.configure(show="" if shown.get() else "•")).grid(row=0, column=2, padx=(8, 0))
+        ttk.Button(row, text="Get a key", command=lambda: webbrowser.open(BETTERTOK_KEYS_URL)).grid(
+            row=0, column=3, padx=(8, 0))
+        status = ttk.Label(row)
+        status.grid(row=1, column=1, sticky="w", pady=(4, 0))
+
+        def update_status(*_):
+            k = self.bt_key.get().strip()
+            if not k:
+                status.configure(text="○  Off: gifts come in through webhooks", style="Off.TLabel")
+            elif k.startswith("btk_"):
+                status.configure(text="●  Key added: restart Fortnite Chaos after saving", style="Good.TLabel")
+            else:
+                status.configure(text="!  BetterTok keys start with btk_live_ — check you copied all of it",
+                                 style="Warn.TLabel")
+        self.bt_key.trace_add("write", update_status)
+        update_status()
+
+        ttk.Label(box, text="Gifts that fire a random effect").grid(sticky="w", pady=(12, 2))
+        ttk.Entry(box, textvariable=self.bt_gifts).grid(sticky="ew", ipady=2)
+        ttk.Label(box, text="Names exactly as BetterTok shows them, with a comma between, like Heart Me, Sunglasses",
+                  style="Hint.TLabel").grid(sticky="w", pady=(2, 0))
+        ttk.Checkbutton(box, text="A follow fires a random effect too", variable=self.bt_follow).grid(
+            sticky="w", pady=(10, 0))
+        ttk.Label(box, style="Warn.TLabel", justify="left", text=(
+            "With a key saved, turn off any BetterTok action that sends these gifts or follows to Fortnite Chaos\n"
+            "as a webhook (Actions & Events), or each one fires twice.")).grid(sticky="w", pady=(10, 0))
 
     # ---- save
     def save(self):
@@ -384,7 +506,8 @@ class Wizard:
             apps = [{"name": r["name"], "process": r["process"], "path": r["path"]}
                     for r in self.rows if r["ticked"].get()]
             new = build_config(self.config, apps, self.chaos.get(), self.boost.get(), clips, reports,
-                               list(self.recordings.get(0, "end")), self.token.get(), self.channel.get())
+                               list(self.recordings.get(0, "end")), self.token.get(), self.channel.get(),
+                               self.bt_key.get(), self.bt_gifts.get(), self.bt_follow.get())
             self.changed = new != self.config
             if self.changed:
                 save_config(new, self.config_path)

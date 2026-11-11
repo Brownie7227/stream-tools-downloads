@@ -24,26 +24,54 @@ No GitHub account needed.
    and your settings only change if you choose to.
 3. Double-click `fortnite_chaos_LAUNCHER.bat`.
 4. In TikTok LIVE Studio, add a **Link** source: `http://127.0.0.1:8766/overlay.html`
-5. In your gift tool (BetterTok or TikFinity), make each gift trigger a webhook, like `http://127.0.0.1:8766/invert`.
+5. Connect your gifts, one of these two ways:
+   - **BetterTok Creator plan (easiest):** see [BetterTok live events](#bettertok-live-events) below.
+   - **Any gift tool (BetterTok, TikFinity):** make each gift trigger a webhook, like `http://127.0.0.1:8766/invert`.
+     `http://127.0.0.1:8766/random` picks a random effect.
 
 To try every effect without sending gifts, open `http://127.0.0.1:8766/panel.html` while it's running.
 **F8 is the panic key:** it turns everything off.
 
+### BetterTok live events
+
+With BetterTok's Creator plan, Fortnite Chaos can get your gifts, follows and chat straight from BetterTok. There are
+no webhook actions to set up, and nothing in BetterTok can quietly stop them firing.
+
+1. Go to [bettertok.app](https://bettertok.app/dashboard/creator/developer), open **Developer**, then **Keys**, and
+   click **Create a key**. Copy it straight away: BetterTok only shows it once.
+2. Run `SETUP.bat`. In **BetterTok live events**, paste the key, check the gifts that should fire a random effect
+   (it starts with Heart Me and Sunglasses) and whether follows should too. Click **Save**.
+3. Restart Fortnite Chaos. Its window says `BetterTok: connected to your live events`.
+4. In BetterTok's **Actions & Events**, turn off any action that sends those gifts or follows to Fortnite Chaos as a
+   webhook, or each one fires twice. Your BetterTok alerts and overlays carry on as normal.
+
+What happens:
+
+- **Gifts** you listed fire one random effect per gift, so a 3x combo fires 3, up to 5 per combo.
+- **Follows** fire a random effect too, if you ticked it. They don't count toward the combo meter or top senders.
+- **Chat** goes into the chat votes, with nothing else to set up.
+
+If the window says `the API key was rejected`, the key was mistyped or deleted. Make a new one and paste it in again.
+Keep the key private, like a password: anyone with it can read your live events.
+
 ### config.json
 
 `SETUP.bat` saves your choices here, so you won't normally need to open it. Updates never change it. Don't share it,
-because it can hold your Discord token.
+because it can hold your Discord token and BetterTok key.
 
 | Setting | What to put |
 |---|---|
 | `discord_token` | Your Discord bot's token, for the `!jumpscare` command. Optional |
 | `discord_channel_id` | The Discord channel it watches. Optional |
+| `bettertok_api_key` | Your BetterTok Developer API key, for [BetterTok live events](#bettertok-live-events). Optional |
+| `bettertok_gifts` | Gift name to effect, like `{"Heart Me": "random", "Rose": "invert"}` |
+| `bettertok_follow` | The effect a follow fires, like `"random"`. Blank means nothing |
 | `reports_folder` | Where reports and logs go. Blank uses `Stream Reports` here |
 | `clips_folder` | Where clips go. Blank uses `Clips` here |
 | `recordings_folders` | Extra folders with your stream recordings, as well as `Videos` |
 | `gift_power` | Makes a gift's effects last longer, like `{"Rose": 1, "Galaxy": 3}` |
 | `menu_every_minutes` | How often the gift menu shows itself. 0 turns it off |
-| `vote_every_minutes` | How often chat votes on an effect. 0 turns it off. Needs chat sent to `/chat` |
+| `vote_every_minutes` | How often chat votes on an effect. 0 turns it off. Needs BetterTok live events, or chat sent to `/chat` |
 | `gift_icons` | Which gift picture shows beside an effect, like `{"random": "rose.png"}` |
 | `apps` | The apps `Start Stream.bat` opens and `End Stream.bat` offers to close |
 | `start_stream` | Whether `Start Stream.bat` runs Fortnite Chaos and Game Boost |
