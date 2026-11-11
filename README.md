@@ -42,8 +42,15 @@ no webhook actions to set up, and nothing in BetterTok can quietly stop them fir
 2. Run `SETUP.bat`. In **BetterTok live events**, paste the key, check the gifts that should fire a random effect
    (it starts with Heart Me and Sunglasses) and whether follows should too. Click **Save**.
 3. Restart Fortnite Chaos. Its window says `BetterTok: connected to your live events`.
-4. In BetterTok's **Actions & Events**, turn off any action that sends those gifts or follows to Fortnite Chaos as a
+4. In BetterTok's **Actions & Events**, turn off any action that sends those gifts to Fortnite Chaos as a
    webhook, or each one fires twice. Your BetterTok alerts and overlays carry on as normal.
+5. Optional, so BetterTok's **test follow** works too: it only goes to actions, not the live events. Add a Follow
+   action with a webhook to `http://127.0.0.1:8766/follow`.
+
+Each viewer's follow fires once a day, even if they unfollow and follow again, or it arrives from both the live
+events and a webhook. While the live events are connected, gift webhooks from BetterTok are ignored, so an old
+gift action left switched on can't fire a second effect (the window says so when it happens). Everything Fortnite
+Chaos prints is also kept in `Stream Reports\chaos-log-<date>.txt`.
 
 What happens:
 

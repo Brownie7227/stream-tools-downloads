@@ -472,10 +472,17 @@ def log(msg):
 
 
 def _log_writer():
+    """Prints each line, and keeps a copy in Stream Reports\\chaos-log-<date>.txt so problems can be looked at later."""
     while True:
         msg = _logq.get()
         try:
             print(msg, flush=True)
+        except Exception:
+            pass
+        try:
+            path = os.path.join(APP_LOG_DIR, time.strftime("chaos-log-%Y-%m-%d.txt"))
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(time.strftime("[%H:%M:%S] ") + str(msg) + "\n")
         except Exception:
             pass
 
@@ -1351,6 +1358,57 @@ def _bettertok_effect(route):
     return route if route in ACTIVATE_ROUTES else None
 
 
+_follows_today = {"date": "", "keys": set()}  # lower-case follower ids/names whose follow already fired today
+_dedupe_lock = threading.Lock()
+
+
+def _keys(names):
+    return {str(n).strip().lower() for n in names if n and str(n).strip()}
+
+
+def _seed_follows():
+    """Followers from today's events log, so a restart doesn't let them fire again. Call with _dedupe_lock held."""
+    today = time.strftime("%Y-%m-%d")
+    if _follows_today["date"] == today:
+        return
+    _follows_today.update(date=today, keys=set())
+    try:
+        with open(os.path.join(APP_LOG_DIR, f"events-{today}.csv"), encoding="utf-8", newline="") as f:
+            for row in csv.DictReader(f):
+                if row.get("gift") == "a follow" and row.get("who"):
+                    _follows_today["keys"].add(row["who"].strip().lower())
+    except OSError:
+        pass
+
+
+def follow_is_repeat(names):
+    """True if this viewer's follow already fired today (refollowing, or the webhook and live feed both
+    sending it). Otherwise remembers them and returns False."""
+    keys = _keys(names)
+    with _dedupe_lock:
+        _seed_follows()
+        if keys & _follows_today["keys"]:
+            return True
+        _follows_today["keys"] |= keys
+    return False
+
+
+def on_follow(names, who, source):
+    """Fire config.json's "bettertok_follow" effect for a new follower. Follows come from the live feed and
+    from a BetterTok webhook (/follow) - BetterTok's test follow only goes to webhooks. Each viewer fires
+    once a day, so unfollow + follow again doesn't fire another one."""
+    name = _bettertok_effect(stream_config.get("bettertok_follow", ""))
+    if not name:
+        return None
+    if follow_is_repeat(names):
+        log(f"{time.strftime('%H:%M:%S')} - follow from {who or 'someone'} ({source}) already fired today, skipped")
+        return None
+    # a follow isn't a gift: no combo meter, no top sender
+    threading.Thread(target=activate, args=(name, None, who, "a follow"),
+                     kwargs={"counted": False}, daemon=True).start()
+    return name
+
+
 def _bettertok_event(evt):
     """One event from the stream: fire what config.json says for it."""
     if not isinstance(evt, dict) or not isinstance(evt.get("data"), dict):
@@ -1377,10 +1435,7 @@ def _bettertok_event(evt):
         for i in range(max(1, min(count, BETTERTOK_MAX_PER_COMBO))):  # one effect per gift in the combo
             threading.Timer(i * BETTERTOK_COMBO_GAP, activate, (name, None, who, gift)).start()
     elif kind == "follow":
-        name = _bettertok_effect(stream_config.get("bettertok_follow", ""))
-        if name:  # a follow isn't a gift: no combo meter, no top sender
-            threading.Thread(target=activate, args=(name, None, who, "a follow"),
-                             kwargs={"counted": False}, daemon=True).start()
+        on_follow([d.get("viewer_id"), d.get("viewer_username"), d.get("display_name")], who, "live feed")
     elif kind == "comment":
         add_chat(_clean(who), d.get("comment") or "")  # chat votes
 
@@ -1546,21 +1601,24 @@ OVERLAY_HTML = """<!doctype html><html><head><meta charset="utf-8">
 #fog{background:#fff}
 #scare{background:#000 center/cover no-repeat url(/jumpscare.png);color:red;font:bold 30vw sans-serif;align-items:center;justify-content:center}
 #flash{background:#fff}
+@font-face{font-family:Lucky;src:url(/font.ttf)}
+:root{--glass:radial-gradient(120% 90% at 100% 0%,rgba(255,59,92,.22),transparent 60%),radial-gradient(120% 90% at 0% 100%,rgba(155,107,255,.28),transparent 60%),linear-gradient(170deg,rgba(19,10,46,.94),rgba(42,15,79,.94));
+  --edge:.12vh solid rgba(255,255,255,.14);--lift:0 .8vh 3vh rgba(0,0,0,.55);--gold:#ffd84d;--muted:#c9c2e6;--lucky:Lucky,Impact,'Segoe UI',sans-serif}
 #timers{position:fixed;left:0;right:0;top:3vh;display:flex;flex-direction:column;align-items:center;gap:1vh;
-  font:800 2.6vh 'Segoe UI',Arial,sans-serif;color:#fff;pointer-events:none}
+  font:400 2.6vh var(--lucky);letter-spacing:.1vh;color:#fff;pointer-events:none}
 #timers.bottom{top:auto;bottom:3vh}
-.pill{min-width:34vh;max-width:90vw;padding:1vh 2vh .9vh;border-radius:1.4vh;background:rgba(10,10,10,.82);
-  box-shadow:0 .4vh 1.6vh rgba(0,0,0,.5);text-align:center;text-shadow:0 .2vh .4vh #000}
-.pill .t{display:flex;justify-content:space-between;gap:2vh}.pill .s{color:#ffcf40}
-.pill .bar{height:.7vh;margin-top:.7vh;border-radius:.4vh;background:rgba(255,255,255,.18);overflow:hidden}
-.pill .bar i{display:block;height:100%;background:linear-gradient(90deg,#ff3b5c,#ffcf40);transition:width .1s linear}
-#banner{position:fixed;left:50%;bottom:12vh;transform:translate(-50%,3vh);opacity:0;max-width:90vw;padding:1.6vh 4vh;
-  border-radius:1.6vh;background:rgba(17,17,17,.93);box-shadow:0 .6vh 2.4vh rgba(0,0,0,.6);text-align:center;
-  font-family:'Segoe UI',Arial,sans-serif;pointer-events:none;transition:opacity .25s,transform .25s}
+.pill{min-width:36vh;max-width:90vw;padding:1.1vh 2vh .9vh;border-radius:1.6vh;background:var(--glass);border:var(--edge);
+  box-shadow:var(--lift);text-align:center;text-shadow:0 .25vh 0 rgba(0,0,0,.45)}
+.pill .t{display:flex;justify-content:space-between;gap:2vh}.pill .s{color:var(--gold)}
+.pill .bar{height:.8vh;margin-top:.7vh;border-radius:.4vh;background:rgba(255,255,255,.14);overflow:hidden}
+.pill .bar i{display:block;height:100%;border-radius:.4vh;background:linear-gradient(90deg,#ff3b5c,#ffd84d);transition:width .1s linear}
+#banner{position:fixed;left:50%;bottom:12vh;transform:translate(-50%,3vh) scale(.96);opacity:0;width:max-content;max-width:90vw;box-sizing:border-box;padding:1.6vh 4vh 1.4vh;
+  border-radius:2vh;background:var(--glass);border:var(--edge);box-shadow:var(--lift);text-align:center;
+  font-family:'Segoe UI',Arial,sans-serif;pointer-events:none;transition:opacity .25s,transform .3s cubic-bezier(.2,1.4,.4,1)}
 #banner.top{bottom:auto;top:3vh}
-#banner.on{opacity:1;transform:translate(-50%,0)}
-#banner .h{font:800 4.2vh 'Segoe UI',Arial,sans-serif;color:#fff;text-shadow:0 .2vh .4vh #000}
-#banner .d{font:600 2.6vh 'Segoe UI',Arial,sans-serif;color:#ffcf40;margin-top:.4vh}
+#banner.on{opacity:1;transform:translate(-50%,0) scale(1)}
+#banner .h{font:400 4.4vh/1.05 var(--lucky);letter-spacing:.15vh;color:#fff;text-shadow:0 .35vh 0 #6b1fd1,0 .6vh 1.2vh rgba(0,0,0,.5)}
+#banner .d{font:700 2.6vh 'Segoe UI',Arial,sans-serif;color:var(--gold);margin-top:.5vh}
 #banner img{height:7vh;display:block;margin:0 auto .4vh}
 #fakeban{background:#14507f url(/fakeban_bg.png) center/cover no-repeat;flex-direction:column;align-items:center;text-align:center;padding-top:30vh;box-sizing:border-box}
 #fakeban .ico{width:5.4vh;height:5.4vh;border-radius:50%;background:#f03c16;color:#fff;font:4.2vh/5.4vh Impact,sans-serif}
@@ -1577,30 +1635,48 @@ OVERLAY_HTML = """<!doctype html><html><head><meta charset="utf-8">
 #wheelbox{position:fixed;left:50%;top:50%;width:36vh;height:36vh;margin:-18vh 0 0 -18vh;display:none;filter:drop-shadow(0 .6vh 2vh rgba(0,0,0,.7))}
 #wheelbox svg{width:100%;height:100%;display:block}
 #wheelarrow{position:absolute;left:50%;top:-1.6vh;margin-left:-1.5vh;border-left:1.5vh solid transparent;border-right:1.5vh solid transparent;border-top:3vh solid #fff}
-#combo{position:fixed;left:2vh;bottom:3vh;width:30vh;display:none;padding:1vh 1.6vh;border-radius:1.2vh;background:rgba(10,10,10,.82);
-  color:#fff;font:800 2.2vh 'Segoe UI',Arial,sans-serif;text-shadow:0 .2vh .4vh #000}
-#combo .t{display:flex;justify-content:space-between}#combo .s{color:#ffcf40}
-#combo .bar{height:1vh;margin-top:.7vh;border-radius:.5vh;background:rgba(255,255,255,.18);overflow:hidden}
-#combo .bar i{display:block;height:100%;background:linear-gradient(90deg,#ffcf40,#ff3b5c);transition:width .2s}
-#top{position:fixed;left:2vh;bottom:19.5vh;width:30vh;box-sizing:border-box;display:none;padding:1.4vh 2vh;border-radius:1.4vh;background:rgba(10,10,10,.86);
-  color:#fff;font:700 2.4vh 'Segoe UI',Arial,sans-serif}
-#top h3{margin:0 0 .8vh;font-size:2.4vh;color:#ffcf40}#top div{display:flex;justify-content:space-between;gap:1vh;margin-top:.3vh}
-#top span:first-child{overflow:hidden;white-space:nowrap;text-overflow:ellipsis}
-#vote{position:fixed;right:2vh;bottom:3vh;width:34vh;display:none;box-sizing:border-box;padding:1.2vh 1.6vh;
-  border-radius:1.4vh;background:rgba(10,10,10,.88);color:#fff;font:700 2.1vh 'Segoe UI',Arial,sans-serif}
-#vote h3{margin:0 0 .8vh;font-size:2.2vh;color:#ffcf40;display:flex;justify-content:space-between}
-#vote .o{display:grid;grid-template-columns:3vh 1fr 3vh;align-items:center;gap:.8vh;margin-top:.5vh;padding:.3vh .6vh;border-radius:.6vh}
-#vote .o b{color:#ffcf40}#vote .o.win{background:#ff3b5c}
+#combo{position:fixed;left:2vh;bottom:3vh;width:30vh;box-sizing:border-box;display:none;padding:1.1vh 1.6vh;border-radius:1.6vh;background:var(--glass);
+  border:var(--edge);box-shadow:var(--lift);color:#fff;font:400 2.3vh var(--lucky);letter-spacing:.1vh;text-shadow:0 .25vh 0 rgba(0,0,0,.45)}
+#combo .t{display:flex;justify-content:space-between}#combo .s{color:var(--gold)}
+#combo .bar{height:1vh;margin-top:.7vh;border-radius:.5vh;background:rgba(255,255,255,.14);overflow:hidden}
+#combo .bar i{display:block;height:100%;border-radius:.5vh;background:linear-gradient(90deg,#ffd84d,#ff3b5c);transition:width .2s}
+#top{position:fixed;left:2vh;bottom:19.5vh;width:30vh;box-sizing:border-box;display:none;padding:1.4vh 2vh;border-radius:1.6vh;background:var(--glass);
+  border:var(--edge);border-left:.6vh solid var(--gold);box-shadow:var(--lift);color:#fff;font:700 2.3vh 'Segoe UI',Arial,sans-serif}
+#top h3{margin:0 0 .8vh;font:400 2.5vh var(--lucky);letter-spacing:.1vh;color:var(--gold)}#top div{display:flex;justify-content:space-between;gap:1vh;margin-top:.4vh}
+#top span:first-child{overflow:hidden;white-space:nowrap;text-overflow:ellipsis}#top span:last-child{font-family:var(--lucky);color:var(--gold)}
+#vote{position:fixed;right:2vh;bottom:3vh;width:34vh;display:none;box-sizing:border-box;padding:1.3vh 1.6vh;
+  border-radius:1.6vh;background:var(--glass);border:var(--edge);border-left:.6vh solid #3fd0ff;box-shadow:var(--lift);color:#fff;font:700 2.1vh 'Segoe UI',Arial,sans-serif}
+#vote h3{margin:0 0 .8vh;font:400 2.3vh var(--lucky);letter-spacing:.1vh;color:#3fd0ff;display:flex;justify-content:space-between}
+#vote .o{display:grid;grid-template-columns:3vh 1fr 3vh;align-items:center;gap:.8vh;margin-top:.5vh;padding:.4vh .7vh;border-radius:.9vh;background:rgba(255,255,255,.06)}
+#vote .o b{font:400 2.2vh var(--lucky);color:var(--gold)}#vote .o.win{background:#ff3b5c;box-shadow:0 0 1.6vh rgba(255,59,92,.7)}
 #vote .bar{grid-column:2/4;height:.7vh;border-radius:.4vh;background:rgba(255,255,255,.15);overflow:hidden}
-#vote .bar i{display:block;height:100%;background:#ffcf40;transition:width .3s}
+#vote .bar i{display:block;height:100%;background:linear-gradient(90deg,#3fd0ff,#ffd84d);transition:width .3s}
 #fakeban .by{font:700 2.2vh 'Segoe UI',Arial,sans-serif;color:#86d4ff;margin-top:2.2vh}
 #creeperby{position:absolute;left:0;right:0;top:50%;transform:translateY(-50%);text-align:center;color:#fff;
   font:min(9vh,9vw)/1 Impact,sans-serif;text-shadow:0 0 2vh #000}
-#menu{position:fixed;right:2vh;top:12vh;width:27vh;display:none;padding:1.2vh 1.4vh;border-radius:1.4vh;background:rgba(10,10,10,.82);
-  color:#fff;font:700 1.9vh 'Segoe UI',Arial,sans-serif}
-#menu h3{margin:.8vh 0 .3vh;font-size:1.6vh;letter-spacing:.1vh;color:#ffcf40;text-transform:uppercase}#menu h3:first-child{margin-top:0}
-#menu div{display:flex;align-items:center;gap:.8vh;padding:.15vh .5vh;border-radius:.6vh}
-#menu div.on{background:#ff3b5c}#menu img{height:2.4vh}
+#menu{position:fixed;right:2vh;top:5vh;width:54vh;box-sizing:border-box;display:none;padding:1.8vh 1.8vh 1.3vh;border-radius:2.4vh;
+  background:var(--glass);border:var(--edge);box-shadow:var(--lift);color:#fff;font-family:'Segoe UI',Arial,sans-serif;animation:menuin .4s cubic-bezier(.2,1.3,.4,1)}
+@keyframes menuin{from{opacity:0;transform:translateX(3vh) scale(.97)}to{opacity:1;transform:none}}
+#menu .mh{text-align:center;margin-bottom:.4vh}
+#menu .mh b{display:block;font:400 4.6vh/.95 var(--lucky);letter-spacing:.2vh;background:linear-gradient(180deg,#fff 35%,#ffd84d);
+  -webkit-background-clip:text;background-clip:text;color:transparent;filter:drop-shadow(0 .45vh 0 #6b1fd1) drop-shadow(0 .8vh 1.2vh rgba(0,0,0,.5))}
+#menu .mh i{display:block;font:400 1.9vh var(--lucky);font-style:normal;letter-spacing:.1vh;color:var(--gold);margin-top:.6vh;text-shadow:0 .25vh 0 rgba(0,0,0,.35)}
+#menu .sh{display:flex;align-items:center;gap:1vh;margin:1.1vh 0 .6vh}
+#menu .sh h3{margin:0;font:400 2.3vh var(--lucky);letter-spacing:.15vh;color:var(--c);text-transform:uppercase}
+#menu .sh span{flex:1;height:.35vh;border-radius:.3vh;background:linear-gradient(90deg,var(--c),transparent)}
+#menu .g{display:grid;grid-template-columns:1fr 1fr;gap:.55vh}
+#menu .it{display:flex;align-items:center;gap:.8vh;min-width:0;padding:.45vh .7vh .45vh .6vh;border-radius:1.1vh;background:rgba(255,255,255,.07);
+  border:.1vh solid rgba(255,255,255,.12);border-left:.5vh solid var(--c);transition:background .2s,box-shadow .2s}
+#menu .it:last-child:nth-child(odd){grid-column:1/-1}
+#menu .it.on{background:rgba(255,255,255,.18);box-shadow:0 0 0 .2vh var(--c),0 0 1.8vh var(--c)}
+#menu .ic{flex:none;width:3.1vh;height:3.1vh;border-radius:.8vh;display:grid;place-items:center;font-size:1.8vh;background:rgba(255,255,255,.09)}
+#menu .ic img{max-width:2.9vh;max-height:2.9vh}
+#menu .tx{flex:1;min-width:0}
+#menu .nm{font:400 1.75vh/1.1 var(--lucky);letter-spacing:.06vh;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+#menu .ds{font:600 1.2vh/1.2 'Segoe UI',Arial,sans-serif;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+#menu .tm{flex:none;font:400 1.45vh var(--lucky);padding:.35vh .6vh .1vh;border-radius:.7vh;background:var(--c);color:#14092b}
+#menu .mf{margin-top:1.1vh;text-align:center;font:700 1.45vh 'Segoe UI',Arial,sans-serif;color:var(--muted)}
+#menu .mf b{font:400 1.7vh var(--lucky);letter-spacing:.08vh;color:var(--gold)}
 </style></head><body>
 <div id="blind" class="fx"></div><div id="fog" class="fx"></div>
 <div id="lowhp" class="fx"></div>
@@ -1660,6 +1736,15 @@ function drawCrater(){
     if(col){x.fillStyle=col;x.fillRect(i*B,j*B,B,B);}
   }
 }
+// The gift menu shrinks to fit: at most MENU_H of the screen's height and MENU_W of its width
+const MENU_H=.8,MENU_W=.5;
+function fitMenu(){
+  const el=$('menu');if(el.style.display!=='block')return;
+  el.style.zoom=1;const h=el.offsetHeight,w=el.offsetWidth;if(!h||!w)return;
+  el.style.zoom=Math.min(1,innerHeight*MENU_H/h,innerWidth*MENU_W/w);
+}
+addEventListener('resize',fitMenu);
+if(document.fonts)document.fonts.ready.then(fitMenu);
 function renderExtras(s){
   const fx=s.effects;
   $('fakeban').style.display=fx.fakeban?'flex':'none';
@@ -1694,9 +1779,16 @@ function renderExtras(s){
   const t=s.top?'<h3>Top chaos senders</h3>'+s.top.map(p=>'<div><span>'+esc(p.who)+'</span><span>'+p.count+'</span></div>').join(''):'';
   if(t!==lastTop){lastTop=t;$('top').innerHTML=t;}
   $('top').style.display=t?'block':'none';
-  const m=s.menu?s.menu.map(g=>'<h3>'+esc(g.title)+'</h3>'+g.items.map(i=>'<div class="'+(i.on?'on':'')+'">'+(i.icon?'<img src="'+i.icon+'">':'')+esc(i.name)+'</div>').join('')).join(''):'';
+  const m=s.menu?'<div class="mh"><b>FORTNITE CHAOS</b><i>Send a gift. Wreck my game.</i></div>'
+    +s.menu.map(g=>'<section style="--c:'+g.color+'"><div class="sh"><h3>'+esc(g.title)+'</h3><span></span></div><div class="g">'
+      +g.items.map(i=>'<div class="it'+(i.on?' on':'')+'"><div class="ic">'+(i.icon?'<img src="'+i.icon+'">':esc(i.emoji||''))+'</div>'
+        +'<div class="tx"><div class="nm">'+esc(i.name)+'</div>'+(i.desc?'<div class="ds">'+esc(i.desc)+'</div>':'')+'</div>'
+        +(i.secs?'<div class="tm">'+i.secs+'</div>':'')+'</div>').join('')+'</div></section>').join('')
+    +'<div class="mf">Same effect again = <b>MORE TIME</b></div>':'';
+  const showMenu=m?'block':'none',grew=showMenu!==$('menu').style.display||m!==lastMenu;
   if(m!==lastMenu){lastMenu=m;$('menu').innerHTML=m;}
-  $('menu').style.display=m?'block':'none';
+  $('menu').style.display=showMenu;
+  if(m&&grew)fitMenu();
 }
 let ver=null;
 function renderState(s){
@@ -1794,10 +1886,11 @@ def overlay_state():
                       "left": max(0.0, round(vote["until"] - now, 1)), "winner": vote["winner"]}
         menu_list = None
         if menu["on"] or now < menu_show["until"]:
-            menu_list = [{"title": title, "items": [
-                {"name": SHORT_NAMES.get(n) or PANEL_LABELS.get(n, n), "on": n in active,
+            menu_list = [{"title": title, "color": GROUP_COLORS[i % len(GROUP_COLORS)], "items": [
+                {"name": _menu_name(n), "on": n in active, "emoji": MENU_INFO.get(n, ("", ""))[0],
+                 "desc": MENU_INFO.get(n, ("", ""))[1], "secs": _menu_secs(n),
                  "icon": _gift_icon(GIFT_ICONS[n]) if n in GIFT_ICONS else None} for n in names]}
-                for title, names in MENU_GROUPS]
+                for i, (title, names) in enumerate(MENU_GROUPS)]
         return {"effects": fx, "timers": timers, "banner": banner, "image": bool(_find_file("jumpscare.png")),
                 "wheel": spin, "combo": streak, "top": top, "menu": menu_list,
                 "vote": voting, "v": OVERLAY_VERSION}
@@ -1809,6 +1902,42 @@ MENU_GROUPS = [
     ("Screen", ["blind", "fog", "jumpscare", "flashbang", "fakeban", "bsod", "blink", "lowhp", "creeper"]),
     ("Specials", ["random", "chaos"]),
 ]
+GROUP_COLORS = ["#ff3b5c", "#ffb020", "#3fd0ff", "#9b6bff"]  # gift menu sections, in order (red, gold, blue, purple)
+# Emoji + one-line description for the gift menu and the test panel
+MENU_INFO = {
+    "invert": ("🔄", "W/S and A/D swapped"), "rotate": ("🌀", "WASD all moved round"),
+    "jumpswap": ("🦘", "jump/crouch swapped"), "noscope": ("🚫", "can't aim down sights"),
+    "invertmouse": ("🙃", "up is down"), "sensitivity": ("🎰", "3x faster or 3x slower"),
+    "lookdown": ("⬇️", "stare at the floor"), "lookup": ("⬆️", "stare at the sky"),
+    "spin": ("🔁", "keeps spinning round"), "mapspam": ("🗺️", "map keeps popping open"),
+    "emote": ("💃", "mid-fight dance break"),
+    "blind": ("🕶️", "tiny circle of vision"), "fog": ("🌫️", "white haze"),
+    "jumpscare": ("😱", "you'll hear it"), "flashbang": ("💥", "white screen + ringing ears"),
+    "fakeban": ("⛔", "a very real-looking ban"), "bsod": ("💻", "my PC \"crashes\""),
+    "blink": ("😴", "eyes keep closing"), "lowhp": ("💓", "heartbeat + red edges"),
+    "creeper": ("🧨", "hiss... BOOM"),
+    "random": ("🎁", "random effect"), "chaos": ("🔥", "two effects at once"),
+    "wheel": ("🎡", "spin for a random effect"),
+    "menu": ("📋", "show or hide the gift menu"), "topsender": ("🏆", "show top senders now"),
+    "vote": ("🗳️", "start a chat vote now"), "chat?user=Test&text=1": ("💬", "test chat: vote 1"),
+}
+MENU_NAMES = {"emote": "Forced emote", "random": "Mystery gift",
+              "chaos": "Chaos mode", "wheel": "Spin the wheel"}
+NO_TIMER = INSTANT | SILENT | {"random", "wheel", "creeper"}  # one-offs: no seconds badge
+
+
+def _menu_name(n):
+    return MENU_NAMES.get(n) or SHORT_NAMES.get(n) or PANEL_LABELS.get(n, n)
+
+
+def _menu_secs(n):
+    """The seconds badge for the gift menu, e.g. "30s" (the longest it can run), or None."""
+    if n in NO_TIMER:
+        return None
+    s = SECONDS.get(n, DEFAULT_SECONDS)
+    return f"{round(max(s) if isinstance(s, tuple) else s)}s"
+
+
 PANEL_GROUPS = [
     ("Controls", ["invert", "rotate", "jumpswap", "noscope", "invertmouse", "sensitivity"]),
     ("Aim + map", ["lookdown", "lookup", "spin", "mapspam"]),
@@ -1822,51 +1951,132 @@ PANEL_LABELS = dict(EFFECT_NAMES, random="Random chaos", wheel="Spin the wheel",
                     menu="Show or hide gift menu",
                     topsender="Show top senders now", vote="Start a chat vote now",
                     **{"chat?user=Test&text=1": "Test chat: vote 1"})
+PANEL_COLORS = {"Controls": "#ff3b5c", "Aim + map": "#ffb020", "One-offs": "#ffb020", "Screen": "#3fd0ff",
+                "Specials": "#9b6bff", "Overlay": "#3ecf8e", "Chat vote": "#3ecf8e"}
 
 PANEL_HTML = '''<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Fortnite Chaos panel</title>
 <style>
-:root{color-scheme:dark;--bg:#111317;--card:#1b1e24;--line:#2c313a;--text:#eef0f3;--muted:#9aa3ae;--accent:#ff3b5c;--ok:#3ecf8e}
-*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:15px/1.4 'Segoe UI',Arial,sans-serif}
-main{max-width:900px;margin:0 auto;padding:20px 16px 40px}
-h1{font-size:22px;margin:0 0 4px}p.sub{margin:0 0 18px;color:var(--muted)}
-.bar{display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin-bottom:14px}
-.bar label{color:var(--muted)}
-input{width:84px;padding:8px;border-radius:8px;border:1px solid var(--line);background:var(--card);color:var(--text);font:inherit}
-h2{font-size:13px;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);margin:22px 0 8px}
-.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:8px}
-button{padding:11px 10px;border-radius:10px;border:1px solid var(--line);background:var(--card);color:var(--text);font:inherit;cursor:pointer;text-align:left}
-button:hover{border-color:var(--accent)}button:active{transform:translateY(1px)}
-button small{display:block;color:var(--muted);font-size:12px}
-button.off{background:var(--accent);border-color:var(--accent);color:#fff;font-weight:700;text-align:center}
-#status{padding:12px 14px;border-radius:10px;background:var(--card);border:1px solid var(--line);min-height:46px}
+@font-face{font-family:Lucky;src:url(/font.ttf)}
+:root{color-scheme:dark;--bg1:#130a2e;--bg2:#2a0f4f;--card:rgba(255,255,255,.07);--line:rgba(255,255,255,.12);--text:#fff;--muted:#c9c2e6;
+  --accent:#ff3b5c;--gold:#ffd84d;--ok:#3ecf8e;--lucky:Lucky,Impact,'Segoe UI',sans-serif}
+*{box-sizing:border-box}
+body{margin:0;min-height:100vh;color:var(--text);font:15px/1.4 'Segoe UI',Arial,sans-serif;
+  background:radial-gradient(900px 600px at 90% -10%,rgba(255,59,92,.28),transparent 60%),radial-gradient(800px 700px at -10% 40%,rgba(63,208,255,.14),transparent 60%),
+  radial-gradient(900px 700px at 100% 100%,rgba(155,107,255,.26),transparent 60%),linear-gradient(170deg,var(--bg1),var(--bg2)) fixed}
+main{max-width:940px;margin:0 auto;padding:28px 16px 48px}
+header{text-align:center;margin-bottom:18px}
+h1{margin:0;font:400 clamp(40px,9vw,64px)/.95 var(--lucky);letter-spacing:2px;background:linear-gradient(180deg,#fff 35%,var(--gold));
+  -webkit-background-clip:text;background-clip:text;color:transparent;filter:drop-shadow(0 4px 0 #6b1fd1) drop-shadow(0 8px 14px rgba(0,0,0,.5))}
+p.sub{margin:10px 0 0;color:var(--muted);font-weight:600}
+.bar{display:flex;flex-wrap:wrap;gap:10px;align-items:center;justify-content:center;margin-bottom:14px}
+.bar label{color:var(--muted);font-weight:600}
+input{width:96px;padding:10px;border-radius:10px;border:1px solid var(--line);background:var(--card);color:var(--text);font:inherit}
+input:focus{outline:2px solid var(--gold);outline-offset:1px}
+.sh{display:flex;align-items:center;gap:12px;margin:26px 0 10px}
+h2{margin:0;font:400 24px var(--lucky);letter-spacing:1.2px;text-transform:uppercase;color:var(--c)}
+.sh span{flex:1;height:3px;border-radius:3px;background:linear-gradient(90deg,var(--c),transparent)}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:8px}
+button{display:flex;align-items:center;gap:10px;padding:9px 10px;border-radius:14px;border:1px solid var(--line);border-left:5px solid var(--c,var(--accent));
+  background:var(--card);color:var(--text);font:inherit;cursor:pointer;text-align:left;transition:background .15s,transform .1s,box-shadow .15s}
+button:hover{background:rgba(255,255,255,.13);box-shadow:0 0 0 1px var(--c,var(--accent)),0 0 14px -2px var(--c,var(--accent))}
+button:active{transform:translateY(1px) scale(.99)}
+button:focus-visible{outline:2px solid var(--gold);outline-offset:2px}
+.ic{flex:none;width:38px;height:38px;border-radius:10px;display:grid;place-items:center;font-size:21px;background:rgba(255,255,255,.08)}
+.tx{min-width:0}.tx b{display:block;font:400 18px/1.1 var(--lucky);letter-spacing:.5px}
+button small{display:block;color:var(--muted);font-size:12.5px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+button small code{display:block;color:rgba(255,255,255,.45);font-size:11.5px}
+button.off{border:0;background:linear-gradient(180deg,#ff5573,#e0263f);color:#fff;font:400 18px var(--lucky);letter-spacing:.8px;padding:12px 18px;
+  box-shadow:0 4px 0 #8f1328,0 8px 18px rgba(255,59,92,.35)}
+button.off:hover{box-shadow:0 4px 0 #8f1328,0 8px 24px rgba(255,59,92,.6)}
+#status{padding:12px 16px;border-radius:14px;background:var(--card);border:1px solid var(--line);min-height:48px;text-align:center;font-weight:600}
 #status b{color:var(--ok)}#status .none{color:var(--muted)}
+.legend{display:none}
+button.fs{border-left-width:1px;padding:10px 14px;font-weight:700;white-space:nowrap}
+:fullscreen button.fs,:-webkit-full-screen button.fs{display:none}
+/* Short screens (a tablet, a small window): everything fits on one screen, no scrolling. The top is one row,
+   and the buttons share whatever height is left, in colour-coded columns instead of headed sections. */
+@media (max-height:760px){
+  /* 100% not 100vh: on phones and tablets 100vh is the height *without* the browser's toolbar, so it overflows */
+  html,body{height:100%;min-height:0;overflow:hidden}
+  main{max-width:none;height:100%;display:flex;flex-direction:column;gap:8px;padding:8px 10px}
+  .top{display:flex;align-items:center;gap:10px;flex:none}
+  header{margin:0;flex:none}
+  h1{font-size:26px;line-height:.9;letter-spacing:1px;filter:drop-shadow(0 2px 0 #6b1fd1)}
+  p.sub,.sh{display:none}
+  .bar{margin:0;flex-wrap:nowrap;gap:6px}
+  .bar label{position:absolute;left:-9999px}  /* the box's placeholder says it instead */
+  input{width:82px;padding:6px 8px}
+  button.off{padding:8px 12px;font-size:15px;white-space:nowrap}
+  button.fs{padding:7px 10px;font-size:13px}
+  #status{flex:1;min-width:0;min-height:0;padding:7px 12px;font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;text-align:left}
+  .legend{display:grid;grid-template-columns:auto auto auto;gap:3px 8px;flex:none;font:11px/1 'Segoe UI',Arial,sans-serif;font-weight:700;color:var(--muted)}
+  .legend i{display:inline-block;width:9px;height:9px;border-radius:3px;margin-right:4px;vertical-align:-1px}
+  .groups{flex:1;min-height:0;display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));
+    grid-auto-rows:minmax(0,1fr);gap:6px}
+  .grid{display:contents}
+  button{padding:4px 10px;border-radius:10px;border-left-width:5px;min-height:0;overflow:hidden}
+  .ic{display:none}  /* room for the words, and older tablets show some of these emoji as empty boxes */
+  .tx b,button small{display:-webkit-box;-webkit-box-orient:vertical;-webkit-line-clamp:2;overflow:hidden;white-space:normal}
+  .tx b{font-size:16px;line-height:1.05}
+  button small{font-size:12px;line-height:1.2;margin-top:2px}
+  button small code{display:none}
+}
 </style></head><body><main>
-<h1>Fortnite Chaos</h1><p class="sub">Test any effect without TikFinity. F8 still works as the panic key.</p>
-<div class="bar"><label for="secs">Seconds</label><input id="secs" type="number" min="1" placeholder="default">
-<button class="off" onclick="go('off')">Turn everything off</button></div>
+<div class="top">
+<header><h1>FORTNITE<br>CHAOS</h1><p class="sub">Test any effect without TikFinity. F8 still works as the panic key.</p></header>
+<div class="bar"><label for="secs">Seconds</label><input id="secs" type="number" min="1" placeholder="Seconds">
+<button class="off" onclick="go('off')">Turn everything off</button>
+<button class="fs" id="fs" onclick="fullscreen()" title="Hide the browser bars">&#x26F6; Fullscreen</button></div>
 <div id="status"><span class="none">Connecting...</span></div>
-GROUPS
+LEGEND
+</div>
+<div class="groups">GROUPS</div>
 </main><script>
+// Every request gives up after 3s, so a hung or restarted Fortnite Chaos can never leave the panel stuck:
+// it keeps retrying on its own and picks up again the moment Chaos answers.
+function get(path){
+  const c=new AbortController(),t=setTimeout(()=>c.abort(),3000);
+  return fetch(path,{cache:'no-store',signal:c.signal}).finally(()=>clearTimeout(t));
+}
 async function go(name){
   const s=document.getElementById('secs').value;
   const q=new URLSearchParams({user:'Test panel'});if(s&&name!=='off')q.set('seconds',s);
-  try{await fetch('/'+name+(name.includes('?')?'&':'?')+q,{cache:'no-store'})}catch(e){}
+  try{await get('/'+name+(name.includes('?')?'&':'?')+q)}catch(e){}
   status();
 }
+let fails=0,busy=false;
 async function status(){
+  if(busy)return;busy=true;  // one check at a time, so slow answers can't pile up
   const el=document.getElementById('status');
   try{
-    const s=await (await fetch('/status',{cache:'no-store'})).json();
+    const s=await (await get('/status')).json();
+    fails=0;
     const parts=Object.entries(s.active).map(([n,l])=>'<b>'+n+'</b> '+l+'s');
     el.innerHTML=parts.length?'Running: '+parts.join(' &middot; '):'<span class="none">Nothing running</span>';
-  }catch(e){el.innerHTML='<span class="none">Fortnite Chaos is not running</span>'}
+  }catch(e){
+    fails++;
+    el.innerHTML='<span class="none">'+(fails<3?'Reconnecting...':'Fortnite Chaos is not answering - still trying')+'</span>';
+  }
+  busy=false;
 }
+document.addEventListener('visibilitychange',()=>{if(!document.hidden)status();});
+function fullscreen(){  // browsers only allow this from a tap, so it's a button
+  const d=document.documentElement,f=d.requestFullscreen||d.webkitRequestFullscreen;
+  if(f)f.call(d).catch&&f.call(d).catch(()=>{});
+}
+if(!(document.documentElement.requestFullscreen||document.documentElement.webkitRequestFullscreen))
+  document.getElementById('fs').style.display='none';
 status();setInterval(status,1000);
 </script></body></html>'''.replace("GROUPS", "".join(
-    "<h2>%s</h2><div class='grid'>%s</div>" % (title, "".join(
-        "<button onclick=\"go('%s')\">%s<small>%s</small></button>" % (n, n, PANEL_LABELS.get(n, n))
-        for n in names)) for title, names in PANEL_GROUPS))
+    "<div class='sh' style='--c:%s'><h2>%s</h2><span></span></div><div class='grid' style='--c:%s'>%s</div>" % (
+        PANEL_COLORS.get(title, "#9b6bff"), title, PANEL_COLORS.get(title, "#9b6bff"), "".join(
+            "<button onclick=\"go('%s')\"><span class='ic'>%s</span><span class='tx'><b>%s</b><small>%s <code>/%s</code></small></span></button>"
+            % (n, MENU_INFO.get(n, ("", ""))[0], _menu_name(n), MENU_INFO.get(n, ("", ""))[1], n.split("?")[0])
+            for n in names)) for title, names in PANEL_GROUPS)).replace("LEGEND", "<div class='legend'>%s</div>" % "".join(
+    "<span><i style='background:%s'></i>%s</span>" % (c, t) for t, c in
+    (("Controls", PANEL_COLORS["Controls"]), ("Aim", PANEL_COLORS["Aim + map"]), ("Screen", PANEL_COLORS["Screen"]),
+     ("Specials", PANEL_COLORS["Specials"]), ("Overlay/chat", PANEL_COLORS["Overlay"]))))
 
 
 # ---------------- webhook server ----------------
@@ -1898,17 +2108,61 @@ def _from_body(body):
         data = json.loads(body.decode("utf-8", "ignore"))
     except Exception:
         return None, None
-    who = next((r for r in (_find(data, k) for k in ("nickname", "displayname", "display_name", "username", "uniqueid", "user")) if r), None)
+    # BetterTok's "username" is the creator's handle, so the viewer's own fields come first
+    who = next((r for r in (_find(data, k) for k in ("nickname", "displayname", "display_name", "viewer_username",
+                                                     "uniqueid", "username", "user")) if r), None)
     gift = next((r for r in (_find(data, k) for k in ("giftname", "gift_name", "gift")) if r), None)
     return who, gift
 
 
+def _viewer_names(body, who):
+    """The viewer's id, @handle and names in a webhook body, for spotting the same viewer twice.
+    Not "username": in BetterTok's events that's the creator's own handle, the same for every viewer."""
+    names = [who]
+    try:
+        parsed = json.loads(body.decode("utf-8", "ignore")) if body else {}
+        names += [_find(parsed, k) for k in ("viewer_id", "viewer_username", "display_name", "nickname",
+                                             "displayname", "uniqueid")]
+    except ValueError:
+        pass
+    creator = _creator_handle(body)
+    return [n for n in names if n and str(n).strip().lower() != creator]
+
+
+def _looks_like_follow(body):
+    """True if a webhook body says it's a follow (its type/event names one)."""
+    try:
+        parsed = json.loads(body.decode("utf-8", "ignore"))
+    except ValueError:
+        return False
+    kind = " ".join(str(_find(parsed, k) or "") for k in ("type", "event", "event_type", "eventtype", "trigger"))
+    return "follow" in kind.lower()
+
+
+def _creator_handle(body):
+    """The creator's @handle in a BetterTok webhook body (lower case), or ""."""
+    try:
+        data = json.loads(body.decode("utf-8", "ignore")) if body else None
+    except ValueError:
+        return ""
+    if not (_find(data, "viewer_username") or _find(data, "viewer_id")):  # not BetterTok's shape: username is the viewer
+        return ""
+    return str(_find(data, "username") or "").strip().lower()
+
+
 ROUTES = sorted(CONTROL | SCREEN | MOVES | INSTANT) + ["random", "wheel", "chaos", "off", "status", "menu", "topsender",
-                                                      "chat", "vote"]
-ACTIVATE_ROUTES = set(ROUTES) - {"off", "status", "menu", "topsender", "chat", "vote"}
+                                                      "chat", "vote", "follow"]
+ACTIVATE_ROUTES = set(ROUTES) - {"off", "status", "menu", "topsender", "chat", "vote", "follow"}
+
+
+class ChaosServer(ThreadingHTTPServer):
+    request_queue_size = 64  # the default 5 could refuse the panel while overlays and webhooks connect at once
+    daemon_threads = True
 
 
 class Handler(BaseHTTPRequestHandler):
+    timeout = 20  # a client that stops sending or reading mid-request frees its thread instead of hanging forever
+
     def log_message(self, *a):
         pass
 
@@ -1942,6 +2196,12 @@ class Handler(BaseHTTPRequestHandler):
                 return self._reply(404, {"error": "no such gift picture"})
             with open(os.path.join(GIFTS_DIR, file), "rb") as f:
                 return self._send(200, f.read(), "image/png")
+        if name == "font.ttf":  # Luckiest Guy, for the gift menu and panel headings
+            path = _find_file("LuckiestGuy-Regular.ttf")
+            if not path:
+                return self._reply(404, {"error": "no LuckiestGuy-Regular.ttf"})
+            with open(path, "rb") as f:
+                return self._send(200, f.read(), "font/ttf")
         if name == "fakeban_bg.png":
             path = _find_file("fakeban_bg.png")
             if not path:
@@ -1989,21 +2249,34 @@ class Handler(BaseHTTPRequestHandler):
             self._reply(200, {"ok": True, "voted": add_chat(_clean(user), text)})
         elif name == "vote":
             self._reply(200, {"ok": True, "options": start_vote()})
+        elif name == "follow":  # BetterTok webhook for follows (fires config.json's "bettertok_follow")
+            self._reply(200, {"ok": True, "effect": on_follow(_viewer_names(body, who), _clean(who), "webhook")})
         elif name == "topsender":
             with lock:
                 top_show["until"] = time.time() + TOP_SENDER_SECONDS if senders else 0.0
                 any_names = bool(senders)
             self._reply(200, {"ok": True, "names": any_names})
         elif name == "status":
-            with lock:
+            with lock:  # reply after letting go of the lock, so a slow browser can't hold up the effects
                 now = time.time()
-                self._reply(200, {"active": {n: max(0, round(e - now)) for n, e in active.items()},
-                                  "discord": discord_status["state"], "bettertok": bettertok_status["state"]})
+                status = {"active": {n: max(0, round(e - now)) for n, e in active.items()},
+                          "discord": discord_status["state"], "bettertok": bettertok_status["state"]}
+            self._reply(200, status)
         elif name in ACTIVATE_ROUTES:
             # BetterTok webhooks always send a JSON body, and only gift events name a gift. So a body
             # without a gift is a follow, share or likes goal: it fires the effect but doesn't fill the
             # combo meter or count as a top sender. Plain links with no body (TikFinity, the panel) count as before.
+            # An old BetterTok action still sending gifts or follows here would fire them a second time next to
+            # the live feed: while the feed is connected, gifts only come from it (config.json "bettertok_gifts"),
+            # and a follower only fires once a day.
             is_gift = not body or bool(gift)
+            if body and gift and bettertok_status["state"] == "connected":
+                log(f"{time.strftime('%H:%M:%S')} - webhook /{name} for {gift} from {who or 'someone'} ignored:"
+                    " gifts come from the BetterTok live feed (turn that BetterTok action off)")
+                return self._reply(200, {"ok": True, "effect": None, "skipped": "gifts come from the live feed"})
+            if body and not gift and _looks_like_follow(body) and follow_is_repeat(_viewer_names(body, who)):
+                log(f"{time.strftime('%H:%M:%S')} - follow from {who or 'someone'} (webhook /{name}) already fired today, skipped")
+                return self._reply(200, {"ok": True, "effect": None, "skipped": "already fired"})
             self._reply(200, {"ok": True, "effect": activate(name, secs, who, gift, counted=is_gift)})
         else:
             self._reply(404, {"routes": ROUTES})
@@ -2519,7 +2792,7 @@ def main():
     # Refuse to start if another copy is already running (two copies cancel each other's
     # key remaps, and the old copy would silently keep receiving the webhooks).
     try:
-        server = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
+        server = ChaosServer(("127.0.0.1", PORT), Handler)
     except OSError:
         print(f"\nERROR: another copy of Fortnite Chaos is already running (port {PORT} is taken).")
         print("Close the other window, or run:  taskkill /f /im python.exe   then start this again.")
