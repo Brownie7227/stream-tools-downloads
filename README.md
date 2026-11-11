@@ -112,8 +112,12 @@ Each is a webhook: `http://127.0.0.1:8766/<name>`
 
 - **Controls (these stack):** `invert` `rotate` `jumpswap` `noscope` `invertmouse` `sensitivity`
 - **Aim and map:** `lookdown` `lookup` `spin` `mapspam` `emote`
-- **Screen:** `blind` `fog` `jumpscare` `flashbang` `fakeban` `bsod` `blink` `lowhp` `creeper`
-- **Random:** `random` picks any effect, `chaos` or `wheel`. `wheel` spins for one effect. `chaos` runs two controls
+- **Screen:** `blind` `fog` `jumpscare` `flashbang` `fakeban` `bsod` `blink` `lowhp` `creeper` `dvd` (a logo bounces
+  round the screen, new colour off every wall, and everyone finds out if it hits a corner)
+- **Random:** `random` picks any effect, `chaos` or `wheel`. `wheel` spins for one effect. `chaos` runs two controls.
+  Any effect can come up, but the longer one hasn't, the more likely it gets, and the last one never comes straight back
+- **Chat votes:** rounds swap between 1-4 and 5-8, so leftover messages don't count. The winner is drawn by share of
+  the votes: 3 votes out of 4 is a 75% chance
 - **Overlay:** `menu` shows or hides the gift menu. `topsender` shows top senders
 
 Add `?seconds=30` to set the length, and `?user=NAME&gift=GIFT` to show who sent it.

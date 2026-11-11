@@ -32,6 +32,7 @@ SCREEN EFFECTS (on your screen AND on stream - stack with the controls above)
   /blink          your eyelids keep closing                  (20s)
   /lowhp          pulsing red screen edges + heartbeat       (20s)
   /creeper        creeper hisses, explodes, leaves a hole in your screen   (10s hole)
+  /dvd            DVD-style logo bounces round the screen, new colour off every wall   (20s)
   /flashbang      white flash, no sound                      (5s)
                   Works like the BetterTok flashbang.py, built in: every gift restarts the flash,
                   it covers your main monitor only, http://127.0.0.1:8765/trigger and Ctrl+Alt+F trigger it,
@@ -119,7 +120,8 @@ PORT = 8766
 DEFAULT_SECONDS = (20, 30)
 SECONDS = {"jumpscare": 1.5, "flashbang": 5.2,  # short on purpose
            "blind": (10, 15), "fog": (10, 15), "spin": 20,
-           "fakeban": 6, "bsod": 6, "blink": 20, "lowhp": 20, "creeper": 11.5}  # creeper = fuse + hole
+           "fakeban": 6, "bsod": 6, "blink": 20, "lowhp": 20, "creeper": 11.5,  # creeper = fuse + hole
+           "dvd": 20}
 MAX_STACK_SECONDS = 90  # repeat gifts add time, but an effect never stacks past this much time left
 PANIC_SCAN = 0x42  # F8
 # Key triggers (scan codes): F5, F6, F7, F9, F10, F11.
@@ -148,6 +150,7 @@ EFFECT_NAMES = {
     "blink": "Blinking eyes",
     "lowhp": "Low HP",
     "creeper": "Creeper hole",
+    "dvd": "DVD bounce",
 }
 # Short names for the mystery wheel and the gift menu
 SHORT_NAMES = {
@@ -155,7 +158,7 @@ SHORT_NAMES = {
     "invertmouse": "Invert mouse", "sensitivity": "Sensitivity", "emote": "Emote", "lookdown": "Look down",
     "lookup": "Look up", "spin": "360 spin", "mapspam": "Map spam", "blind": "Blind", "fog": "Fog",
     "jumpscare": "Jumpscare", "flashbang": "Flashbang", "fakeban": "Fake ban", "bsod": "Blue screen",
-    "blink": "Blink", "lowhp": "Low HP", "creeper": "Creeper",
+    "blink": "Blink", "lowhp": "Low HP", "creeper": "Creeper", "dvd": "DVD bounce",
 }
 # Your Fortnite binds, as scan codes (layout independent)
 W, A, S, D = 0x11, 0x1E, 0x1F, 0x20
@@ -217,10 +220,10 @@ GIFT_ICONS = stream_config.get("gift_icons", {})
 # ------------------------------------------
 
 CONTROL = {"invert", "rotate", "jumpswap", "noscope", "invertmouse", "sensitivity"}
-SCREEN = {"blind", "fog", "jumpscare", "flashbang", "fakeban", "bsod", "blink", "lowhp", "creeper"}
+SCREEN = {"blind", "fog", "jumpscare", "flashbang", "fakeban", "bsod", "blink", "lowhp", "creeper", "dvd"}
 SILENT = {"jumpscare", "flashbang", "fakeban", "bsod"}  # no banner while they run (it would spoil them)
 CREDIT_AFTER = {"fakeban", "bsod"}  # the banner naming the sender comes when these end
-TIMED_SCREEN = {"blink", "lowhp", "creeper"}  # screen effects that show a timer on the overlay
+TIMED_SCREEN = {"blink", "lowhp", "creeper", "dvd"}  # screen effects that show a timer on the overlay
 MOVES = {"lookdown", "lookup", "spin", "mapspam"}  # timed, but stack with controls instead of replacing them
 INSTANT = {"emote"}  # one-offs that don't replace anything
 RANDOM_POOL = CONTROL | SCREEN | MOVES | INSTANT
@@ -435,6 +438,7 @@ EFFECTS = {
     "blink": dict,
     "lowhp": dict,
     "creeper": dict,
+    "dvd": lambda: {"x0": random.random(), "y0": random.random()},  # where on its bounce path it starts
 }
 
 # ---------------- state ----------------
@@ -462,7 +466,8 @@ top_show = {"next": time.time() + random.uniform(*TOP_SENDER_EVERY), "until": 0.
 menu = {"on": False}  # gift menu on the overlay
 menu_show = {"next": 0.0, "until": 0.0}  # when the gift menu next shows itself
 chat = {"last": 0.0}  # when the last chat message arrived
-vote = {"id": 0, "options": [], "votes": {}, "until": 0.0, "winner": None, "show_until": 0.0, "next": 0.0}
+vote = {"id": 0, "options": [], "votes": {}, "until": 0.0, "winner": None, "show_until": 0.0, "next": 0.0,
+        "first": 1 + VOTE_OPTIONS}  # number of the first option: rounds swap between 1-4 and 5-8
 _logq = queue.Queue()
 
 
@@ -571,19 +576,31 @@ def _stack(name, secs, now):
         _start(name, now + secs)
 
 
-_bags = {}  # shuffled draws for random chaos and the wheel, so nothing repeats until everything has had a turn
+# Random chaos and the wheel: every effect can come up, but the longer one hasn't, the more likely it gets.
+# Weight = 1 + WAIT_BOOST for each pick it has missed, up to WAIT_CAP picks (so at most 2.5x as likely).
+# Effects that haven't come up yet this stream start at the top. The last pick never comes straight back.
+WAIT_BOOST = 0.15
+WAIT_CAP = 10
+_waits = {}  # draw name ("random", "wheel") -> {effect: picks since it last came up}
+_last_pick = {}
+
+
+def _weights(key, pool):
+    waits = _waits.setdefault(key, {})
+    return {e: 0.0 if e == _last_pick.get(key) and len(pool) > 1 else 1 + WAIT_BOOST * min(waits.get(e, WAIT_CAP), WAIT_CAP)
+            for e in sorted(pool)}
 
 
 def _draw(key, pool):
-    """Next pick from a shuffled bag. A new bag never starts with the effect that just ended the last one."""
-    bag = _bags.setdefault(key, {"left": [], "last": None})
-    bag["left"] = [x for x in bag["left"] if x in pool]  # effects switched off since stay out
-    if not bag["left"]:
-        bag["left"] = random.sample(sorted(pool), len(pool))
-        if len(bag["left"]) > 1 and bag["left"][-1] == bag["last"]:
-            bag["left"][0], bag["left"][-1] = bag["left"][-1], bag["left"][0]
-    bag["last"] = bag["left"].pop()
-    return bag["last"]
+    """Next effect for this kind of draw, weighted towards the ones that haven't come up lately."""
+    weights = _weights(key, pool)
+    pick = random.choices(list(weights), weights=list(weights.values()))[0]
+    waits = _waits[key]
+    for e in pool:
+        waits[e] = min(waits.get(e, WAIT_CAP) + 1, WAIT_CAP)
+    waits[pick] = 0
+    _last_pick[key] = pick
+    return pick
 
 
 def _spin_wheel(pick):
@@ -601,24 +618,29 @@ def _spin_wheel(pick):
 
 
 def start_vote():
-    """Chat gets VOTE_SECONDS to type 1-4. Returns the options."""
+    """Chat gets VOTE_SECONDS to vote. Rounds swap between 1-4 and 5-8, so messages left over from the last
+    vote can't count in this one. Returns the options."""
     with lock:
         now = time.time()
-        vote.update(id=vote["id"] + 1, options=random.sample(sorted(RANDOM_POOL), VOTE_OPTIONS), votes={},
+        first = 1 + VOTE_OPTIONS if vote["first"] == 1 else 1
+        vote.update(id=vote["id"] + 1, options=random.sample(sorted(RANDOM_POOL), VOTE_OPTIONS), votes={}, first=first,
                     until=now + VOTE_SECONDS, winner=None, show_until=0.0,
                     next=now + max(1.0, _minutes("vote_every_minutes", 5)) * 60)
         return list(vote["options"])
 
 
 def add_chat(user, text):
-    """A chat message. Returns the option it voted for (1-4), or None."""
+    """A chat message. Returns the number it voted for (e.g. 1-4 or 5-8), or None."""
     with lock:
         chat["last"] = time.time()
         m = re.fullmatch(r"\s*#?\s*([1-9])\s*", text or "")
-        if not m or time.time() >= vote["until"] or not (1 <= int(m.group(1)) <= len(vote["options"])):
+        if not m or time.time() >= vote["until"]:
             return None
+        option = int(m.group(1)) - vote["first"] + 1  # 1 = the first option on screen
+        if not 1 <= option <= len(vote["options"]):
+            return None  # a number from the last round
         key = user or f"anon{len(vote['votes'])}"  # nameless messages each count once
-        vote["votes"][key] = int(m.group(1))  # changing your mind replaces your vote
+        vote["votes"][key] = option  # changing your mind replaces your vote
         return int(m.group(1))
 
 
@@ -632,8 +654,8 @@ def finish_vote():
         if not any(counts):
             vote["show_until"] = 0.0
             return None
-        best = max(counts)
-        vote["winner"] = random.choice([i for i, c in enumerate(counts) if c == best])
+        # proportional: an option with 30% of the votes has a 30% chance, so every vote counts
+        vote["winner"] = random.choices(range(len(counts)), weights=counts)[0]
         vote["show_until"] = time.time() + VOTE_RESULT_SECONDS
         effect = vote["options"][vote["winner"]]
     activate(effect, None, "Chat vote", None, counted=False)
@@ -1581,6 +1603,24 @@ def blink_amount(elapsed):
     return 0.0
 
 
+DVD_SPEED = (0.23, 0.31)  # DVD bounce: screen-widths and screen-heights per second (different, so it wanders)
+DVD_SIZE = 0.24           # logo width, as a fraction of the screen width
+DVD_COLORS = ("#ff3b5c", "#ffd84d", "#3fd0ff", "#9b6bff", "#3ecf8e", "#ff8a3d")
+
+
+def dvd_pos(elapsed, x0, y0):
+    """DVD bounce: where the logo is (0-1 across the free space each way), how many walls it has hit, and
+    whether it's in a corner. The overlay works this out the same way, so both bounce together."""
+    def bounce(p):
+        p %= 2
+        return p if p < 1 else 2 - p
+    px, py = x0 + DVD_SPEED[0] * elapsed, y0 + DVD_SPEED[1] * elapsed
+    fx, fy = bounce(px), bounce(py)
+    hits = int(px) + int(py)
+    corner = min(fx, 1 - fx) < 0.02 and min(fy, 1 - fy) < 0.02
+    return fx, fy, hits, corner
+
+
 def lowhp_pulse(elapsed):
     """Heart pulse: jumps to 1 on each beat, then fades."""
     return math.exp(-(elapsed % LOWHP_BEAT) * 4)
@@ -1632,6 +1672,10 @@ OVERLAY_HTML = """<!doctype html><html><head><meta charset="utf-8">
 #lidt,#lidb{background:#000}
 #lowhp{background:radial-gradient(ellipse at center,transparent 45%,rgba(190,0,0,.9) 100%)}
 #creeper{pointer-events:none}#creeper canvas{position:absolute;inset:0;width:100%;height:100%}
+#dvd{pointer-events:none}
+#dvdlogo{position:absolute;left:0;top:0;width:DVDW%;aspect-ratio:2.2;border-radius:50%/42%;display:flex;align-items:center;justify-content:center;
+  font:400 min(9vw,9vh) Lucky,Impact,sans-serif;letter-spacing:.4vh;color:#14092b;box-shadow:0 .8vh 2.4vh rgba(0,0,0,.45);transition:background .15s}
+#dvdlogo small{position:absolute;bottom:14%;font:800 min(1.6vw,1.6vh) 'Segoe UI',Arial,sans-serif;letter-spacing:.5vh}
 #wheelbox{position:fixed;left:50%;top:50%;width:36vh;height:36vh;margin:-18vh 0 0 -18vh;display:none;filter:drop-shadow(0 .6vh 2vh rgba(0,0,0,.7))}
 #wheelbox svg{width:100%;height:100%;display:block}
 #wheelarrow{position:absolute;left:50%;top:-1.6vh;margin-left:-1.5vh;border-left:1.5vh solid transparent;border-right:1.5vh solid transparent;border-top:3vh solid #fff}
@@ -1682,6 +1726,7 @@ OVERLAY_HTML = """<!doctype html><html><head><meta charset="utf-8">
 <div id="lowhp" class="fx"></div>
 <div id="lidt" class="fx"></div><div id="lidb" class="fx"></div>
 <div id="creeper" class="fx"><canvas id="crater"></canvas><canvas id="face"></canvas><div id="creeperby"></div></div>
+<div id="dvd" class="fx"><div id="dvdlogo">DVD<small>CHAOS VIDEO</small></div></div>
 <div id="fakeban" class="fx"><div class="ico">!</div><div class="ttl">__BAN_TITLE__</div><div class="ln"></div><div class="msg">__BAN_TEXT__</div><div class="ln"></div><div class="btn">CONTINUE</div><div class="by"></div></div>
 <div id="bsod" class="fx"><b>:(</b><p>Your PC ran into a problem and needs to restart. We're just collecting some error info, and then we'll restart for you.</p><p>20% complete</p><small>Stop code: <span id="bsodcode">TOO_MANY_GIFTS</span></small></div>
 <div id="scare" class="fx"></div><div id="flash" class="fx"></div>
@@ -1745,6 +1790,17 @@ function fitMenu(){
 }
 addEventListener('resize',fitMenu);
 if(document.fonts)document.fonts.ready.then(fitMenu);
+// DVD bounce: same maths as dvd_pos() in Python, so it moves just like the one on the streamer's screen.
+// Drawn every frame from the last update plus the time since, so it glides instead of stepping.
+let dvd=null;
+function dvdPlace(){
+  if(!dvd)return;
+  const t=dvd.elapsed+(performance.now()-dvd.at)/1000,bx=p=>{p%=2;return p<1?p:2-p;};
+  const px=dvd.x0+DVDSX*t,py=dvd.y0+DVDSY*t,el=$('dvdlogo');
+  el.style.transform='translate('+bx(px)*(innerWidth-el.offsetWidth)+'px,'+bx(py)*(innerHeight-el.offsetHeight)+'px)';
+  el.style.background=DVDC[(Math.floor(px)+Math.floor(py))%DVDC.length];
+}
+function dvdFrame(){if(dvd){dvdPlace();requestAnimationFrame(dvdFrame);}}
 function renderExtras(s){
   const fx=s.effects;
   $('fakeban').style.display=fx.fakeban?'flex':'none';
@@ -1765,14 +1821,18 @@ function renderExtras(s){
     $('crater').style.display=e>=FUSE+BLAST?'block':'none';
     $('creeperby').textContent=(e>=FUSE+BLAST&&fx.creeper.who)?fx.creeper.who.toUpperCase()+' WAS HERE':'';
   }else{creeperOn=false;$('creeper').style.display='none';}
+  if(fx.dvd){if(!dvd)requestAnimationFrame(dvdFrame);dvd={x0:fx.dvd.x0,y0:fx.dvd.y0,elapsed:fx.dvd.elapsed,at:performance.now()};}
+  else dvd=null;
+  $('dvd').style.display=dvd?'block':'none';
+  dvdPlace();  // also moved on every update, in case the page isn't drawing animation frames
   if(s.wheel){
     if(s.wheel.id!==wheelId){wheelId=s.wheel.id;drawWheel(s.wheel);}
     $('wheelbox').style.display='block';
   }else $('wheelbox').style.display='none';
   const v=s.vote,vb=$('vote');
   if(v){vb.style.display='block';const total=v.counts.reduce((a,b)=>a+b,0)||1;
-    vb.innerHTML='<h3><span>'+(v.winner===null?'CHAT VOTE - type 1-'+v.options.length:'CHAT PICKED')+'</span><span>'+(v.winner===null?Math.ceil(v.left)+'s':'')+'</span></h3>'
-      +v.options.map((o,i)=>'<div class="o'+(v.winner===i?' win':'')+'"><b>'+(i+1)+'</b><span>'+esc(o)+'</span><span>'+v.counts[i]+'</span><div class="bar"><i style="width:'+(v.counts[i]/total*100)+'%"></i></div></div>').join('');
+    const f=v.first||1;vb.innerHTML='<h3><span>'+(v.winner===null?'CHAT VOTE - type '+f+'-'+(f+v.options.length-1):'CHAT PICKED')+'</span><span>'+(v.winner===null?Math.ceil(v.left)+'s':'')+'</span></h3>'
+      +v.options.map((o,i)=>'<div class="o'+(v.winner===i?' win':'')+'"><b>'+(f+i)+'</b><span>'+esc(o)+'</span><span>'+v.counts[i]+'</span><div class="bar"><i style="width:'+(v.counts[i]/total*100)+'%"></i></div></div>').join('');
   }else vb.style.display='none';
   const c=s.combo;$('combo').style.display=c?'block':'none';
   if(c){$('combo').querySelector('.s').textContent=c.count+' / '+c.goal;$('combo').querySelector('i').style.width=c.count/c.goal*100+'%';}
@@ -1831,7 +1891,9 @@ poll();
 </script></body></html>""".replace("HOLE", str(round(BLIND_HOLE * 100))).replace(
     "__SPIN__", str(WHEEL_SPIN)).replace("__FUSE__", str(CREEPER_FUSE)).replace(
     "__BLAST__", str(CREEPER_BLAST)).replace("__CRATER__", str(CREEPER_HOLE)).replace(
-    "__BAN_TITLE__", FAKE_BAN_TITLE).replace("__BAN_TEXT__", FAKE_BAN_TEXT)
+    "__BAN_TITLE__", FAKE_BAN_TITLE).replace("__BAN_TEXT__", FAKE_BAN_TEXT).replace(
+    "DVDW", str(round(DVD_SIZE * 100))).replace("DVDSX", str(DVD_SPEED[0])).replace(
+    "DVDSY", str(DVD_SPEED[1])).replace("DVDC", json.dumps(DVD_COLORS))
 OVERLAY_VERSION = hashlib.md5(OVERLAY_HTML.encode("utf-8")).hexdigest()[:10]  # overlays reload when this changes
 
 
@@ -1850,6 +1912,8 @@ def overlay_state():
                 fx[n]["pulse"] = round(lowhp_pulse(elapsed), 3)
             elif n == "creeper":
                 fx[n]["elapsed"] = round(elapsed, 3)
+            elif n == "dvd":
+                fx[n].update(elapsed=round(elapsed, 3), x0=data[n]["x0"], y0=data[n]["y0"])
             if n in NAMED_EFFECTS:
                 fx[n]["who"] = (data.get(n) or {}).get("who", "")
                 if n == "bsod":
@@ -1883,7 +1947,7 @@ def overlay_state():
             for choice in vote["votes"].values():
                 counts[choice - 1] += 1
             voting = {"id": vote["id"], "options": [SHORT_NAMES.get(o, o) for o in vote["options"]], "counts": counts,
-                      "left": max(0.0, round(vote["until"] - now, 1)), "winner": vote["winner"]}
+                      "left": max(0.0, round(vote["until"] - now, 1)), "winner": vote["winner"], "first": vote["first"]}
         menu_list = None
         if menu["on"] or now < menu_show["until"]:
             menu_list = [{"title": title, "color": GROUP_COLORS[i % len(GROUP_COLORS)], "items": [
@@ -1899,7 +1963,7 @@ def overlay_state():
 MENU_GROUPS = [
     ("Controls", ["invert", "rotate", "jumpswap", "noscope", "invertmouse", "sensitivity"]),
     ("Aim + map", ["lookdown", "lookup", "spin", "mapspam", "emote"]),
-    ("Screen", ["blind", "fog", "jumpscare", "flashbang", "fakeban", "bsod", "blink", "lowhp", "creeper"]),
+    ("Screen", ["blind", "fog", "jumpscare", "flashbang", "fakeban", "bsod", "blink", "lowhp", "creeper", "dvd"]),
     ("Specials", ["random", "chaos"]),
 ]
 GROUP_COLORS = ["#ff3b5c", "#ffb020", "#3fd0ff", "#9b6bff"]  # gift menu sections, in order (red, gold, blue, purple)
@@ -1916,6 +1980,7 @@ MENU_INFO = {
     "fakeban": ("⛔", "a very real-looking ban"), "bsod": ("💻", "my PC \"crashes\""),
     "blink": ("😴", "eyes keep closing"), "lowhp": ("💓", "heartbeat + red edges"),
     "creeper": ("🧨", "hiss... BOOM"),
+    "dvd": ("📀", "bouncing logo in the way"),
     "random": ("🎁", "random effect"), "chaos": ("🔥", "two effects at once"),
     "wheel": ("🎡", "spin for a random effect"),
     "menu": ("📋", "show or hide the gift menu"), "topsender": ("🏆", "show top senders now"),
@@ -1942,7 +2007,7 @@ PANEL_GROUPS = [
     ("Controls", ["invert", "rotate", "jumpswap", "noscope", "invertmouse", "sensitivity"]),
     ("Aim + map", ["lookdown", "lookup", "spin", "mapspam"]),
     ("One-offs", ["emote"]),
-    ("Screen", ["blind", "fog", "jumpscare", "flashbang", "fakeban", "bsod", "blink", "lowhp", "creeper"]),
+    ("Screen", ["blind", "fog", "jumpscare", "flashbang", "fakeban", "bsod", "blink", "lowhp", "creeper", "dvd"]),
     ("Specials", ["random", "wheel", "chaos"]),
     ("Overlay", ["menu", "topsender"]),
     ("Chat vote", ["vote", "chat?user=Test&text=1"]),
@@ -2539,7 +2604,7 @@ def run_popups():
         ("flashbang", "#ffffff", None), ("jumpscare", "#000000", None),
         ("fakeban", "#0b0b12", None), ("bsod", "#0078d7", None), ("blink", KEY, KEY),
         ("lowhp", "#b00000", KEY), ("lowhp2", "#b00000", KEY), ("lowhp3", "#b00000", KEY),
-        ("creeper", KEY, KEY), ("creeper_face", KEY, KEY))}
+        ("creeper", KEY, KEY), ("creeper_face", KEY, KEY), ("dvd", KEY, KEY))}
     c = tk.Canvas(wins["blind"], width=sw, height=sh, bg="#000000", highlightthickness=0)
     c.pack()
     r = sh * BLIND_HOLE
@@ -2647,12 +2712,33 @@ def run_popups():
             crater.create_text(sw / 2, sh / 2, text=f"{who.upper()} WAS HERE", fill="#ffffff",
                                font=("Impact", -int(sh * .07)))
 
+    # DVD bounce: a logo that bounces round the screen, changing colour off every wall
+    dvd_c = tk.Canvas(wins["dvd"], width=sw, height=sh, bg=KEY, highlightthickness=0)
+    dvd_c.pack()
+    dw = int(sw * DVD_SIZE)
+    dh = int(dw / 2.2)
+    dvd_shape = dvd_c.create_oval(0, 0, dw, dh, fill=DVD_COLORS[0], outline="")
+    dvd_text = dvd_c.create_text(dw / 2, dh * .44, text="DVD", fill="#14092b", font=("Impact", -int(dh * .5)))
+    dvd_sub = dvd_c.create_text(dw / 2, dh * .8, text="CHAOS VIDEO", fill="#14092b",
+                                font=("Segoe UI", -int(dh * .1), "bold"))
+
+    def update_dvd(elapsed, info):
+        fx, fy, hits, corner = dvd_pos(elapsed, info["x0"], info["y0"])
+        x, y = fx * (sw - dw), fy * (sh - dh)
+        dvd_c.coords(dvd_shape, x, y, x + dw, y + dh)
+        dvd_c.coords(dvd_text, x + dw / 2, y + dh * .44)
+        dvd_c.coords(dvd_sub, x + dw / 2, y + dh * .8)
+        dvd_c.itemconfig(dvd_shape, fill=DVD_COLORS[hits % len(DVD_COLORS)])
+        if corner and state["dvd_corner"] != hits:  # everyone waits for this
+            state["dvd_corner"] = hits
+            announce("IT HIT THE CORNER!", "The DVD logo finally did it")
+
     hwnds = {n: click_through(w) for n, w in wins.items()}
-    for n in ("blind", "jumpscare", "fakeban", "bsod", "blink", "creeper", "creeper_face"):
+    for n in ("blind", "jumpscare", "fakeban", "bsod", "blink", "creeper", "creeper_face", "dvd"):
         wins[n].attributes("-alpha", 1.0)
     EXTRA_WINDOWS = {"lowhp": ("lowhp2", "lowhp3"), "creeper": ("creeper_face",)}
 
-    state = {"hide_at": 0.0, "heart_at": 0.0, "creeper_stage": ""}
+    state = {"hide_at": 0.0, "heart_at": 0.0, "creeper_stage": "", "dvd_corner": -1}
     screens = {}  # effect name -> start data while it is on screen
 
     mci = ctypes.windll.winmm.mciSendStringW
@@ -2744,7 +2830,7 @@ def run_popups():
                 now = time.time()
                 want = {n: (data.get(n), active[n] - now) for n in SCREEN & set(active)}
                 flash_total = totals.get("flashbang", 1)
-                spent = {n: totals[n] - (active[n] - now) for n in ("blink", "lowhp", "creeper") if n in active}
+                spent = {n: totals[n] - (active[n] - now) for n in ("blink", "lowhp", "creeper", "dvd") if n in active}
             for n in list(screens):
                 if n not in want:
                     stop_screen(n)
@@ -2765,11 +2851,13 @@ def run_popups():
                     new = True
                 if n == "creeper":
                     update_creeper(spent[n])
+                elif n == "dvd" and started:
+                    update_dvd(spent[n], started)
             if new and state["hide_at"]:
                 show(banner)  # keep the banner above the effects
         except Exception:
             traceback.print_exc()
-        root.after(30 if screens.keys() & {"flashbang", "blink", "creeper"} else 50, poll)
+        root.after(16 if "dvd" in screens else 30 if screens.keys() & {"flashbang", "blink", "creeper"} else 50, poll)
 
     poll()
     root.mainloop()
