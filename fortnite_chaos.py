@@ -2049,6 +2049,9 @@ button.off:hover{box-shadow:0 4px 0 #8f1328,0 8px 24px rgba(255,59,92,.6)}
 .legend{display:none}
 button.fs{border-left-width:1px;padding:10px 14px;font-weight:700;white-space:nowrap}
 :fullscreen button.fs,:-webkit-full-screen button.fs{display:none}
+#xfs{display:none}  /* the exit button swaps in for the fullscreen one */
+:fullscreen #xfs{display:flex}
+:-webkit-full-screen #xfs{display:flex}
 /* Short screens (a tablet, a small window): everything fits on one screen, no scrolling. The top is one row,
    and the buttons share whatever height is left, in colour-coded columns instead of headed sections. */
 @media (max-height:760px){
@@ -2082,7 +2085,8 @@ button.fs{border-left-width:1px;padding:10px 14px;font-weight:700;white-space:no
 <header><h1>FORTNITE<br>CHAOS</h1><p class="sub">Test any effect without TikFinity. F8 still works as the panic key.</p></header>
 <div class="bar"><label for="secs">Seconds</label><input id="secs" type="number" min="1" placeholder="Seconds">
 <button class="off" onclick="go('off')">Turn everything off</button>
-<button class="fs" id="fs" onclick="fullscreen()" title="Hide the browser bars">&#x26F6; Fullscreen</button></div>
+<button class="fs" id="fs" onclick="fullscreen()" title="Hide the browser bars">&#x26F6; Fullscreen</button>
+<button class="fs" id="xfs" onclick="exitFullscreen()" title="Show the browser bars again">&#x2715; Exit fullscreen</button></div>
 <div id="status"><span class="none">Connecting...</span></div>
 LEGEND
 </div>
@@ -2118,7 +2122,11 @@ async function status(){
 document.addEventListener('visibilitychange',()=>{if(!document.hidden)status();});
 function fullscreen(){  // browsers only allow this from a tap, so it's a button
   const d=document.documentElement,f=d.requestFullscreen||d.webkitRequestFullscreen;
-  if(f)f.call(d).catch&&f.call(d).catch(()=>{});
+  const p=f&&f.call(d);if(p&&p.catch)p.catch(()=>{});
+}
+function exitFullscreen(){
+  const f=document.exitFullscreen||document.webkitExitFullscreen;
+  const p=f&&f.call(document);if(p&&p.catch)p.catch(()=>{});
 }
 if(!(document.documentElement.requestFullscreen||document.documentElement.webkitRequestFullscreen))
   document.getElementById('fs').style.display='none';
